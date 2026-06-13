@@ -1,8 +1,15 @@
-use std::sync::{Arc, RwLock, atomic::Ordering};
+pub mod screens;
+pub mod common;
+
+use std::sync::{Arc, RwLock};
 
 use avian3d::prelude::*;
 use bevy::prelude::*;
 
+use crate::app::screens::game_state::*;
+use crate::app::common::text::*;
+use crate::app::screens::game_menu::*;
+use crate::app::screens::join_game::*;
 use crate::{client::GameClient, server::{ClientEvent, ServerEvent}};
 
 /// Identifies an entity as a player-controlled body.
@@ -24,13 +31,30 @@ pub struct GameClientWrapper {
     pub client: Arc<RwLock<GameClient>>,
 }
 
-pub fn run(client: GameClientWrapper) {
+pub fn run() {
     App::new()
         .add_plugins(DefaultPlugins)
         .add_plugins(PhysicsPlugins::default())
-        .insert_resource(client)
-        .add_systems(Startup, setup)
-        .add_systems(Update, (move_player, drain_server_events))
+        .init_state::<AppState>()
+        .add_systems(OnEnter(AppState::Menu), setup_menu)
+        .add_systems(
+            Update,
+            (handle_join_game_button, handle_create_game_button, update_server_status_text)
+                .run_if(in_state(AppState::Menu)),
+        )
+        .add_systems(OnExit(AppState::Menu), cleanup_menu)
+        .add_systems(OnEnter(AppState::JoinGame), setup_join_screen)
+        .add_systems(
+            Update,
+            (focus_input_field, update_input, handle_join_online_submit_button, handle_join_local_server_button)
+                .run_if(in_state(AppState::JoinGame)),
+        )
+        .add_systems(OnExit(AppState::JoinGame), cleanup_join_screen)
+        .add_systems(OnEnter(AppState::Playing), setup)
+        .add_systems(
+            Update,
+            (move_player, drain_server_events).run_if(in_state(AppState::Playing)),
+        ) 
         .run();
 }
 
@@ -86,10 +110,6 @@ fn move_player(
         if player.direction != velocity {
             player.direction = velocity;
             if let Some(sender) = &client.client.read().unwrap().sender {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_millis();
                 sender.send(ClientEvent::Movement { player_id: 0, x: velocity.x, y: velocity.z }).ok();
             }
         }

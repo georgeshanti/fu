@@ -1,6 +1,6 @@
 use crate::server::{ClientEvent, ServerEvent};
 use bevy::prelude::*;
-use std::{sync::{Arc, Mutex, atomic::{AtomicU64, Ordering}, mpsc::{self, Receiver, Sender}}, thread::{self, JoinHandle}};
+use std::{sync::{Arc, Mutex, mpsc::{self, Receiver, Sender}}, thread::{self, JoinHandle}};
 
 /// Client-side handle: handle local game UI state and capture player input events
 pub struct GameClient {
