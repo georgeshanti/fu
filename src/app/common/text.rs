@@ -8,6 +8,13 @@ pub struct InputField {
     value: String,
 }
 
+impl InputField {
+    /// The text currently entered into this field.
+    pub fn value(&self) -> &str {
+        &self.value
+    }
+}
+
 /// Marks the `Text` entity that displays a join input field's contents.
 #[derive(Component)]
 pub struct InputText;

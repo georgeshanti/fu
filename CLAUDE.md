@@ -21,14 +21,12 @@ It is a 3D game built in Rust using on Bevy and Avian 3D.
 Players spawn with knives in their hands and must hunt each other down and kill them.
 
 # General working
-- Spawn app
-- Spawn game server
-- Spawn game client
-- Attach game client to server
-- Start game at server
-- Capture player events at client and send to server
-- Process player events at server and determine game events and send to client
-- Process game events at client and update Game UI
+- Player either creates or joins a game server
+- Game servers - manage the state of the game
+- Game clients are a way for the application to communicate with the game server
+- Events are sent to the Game server through a sender field on the game client
+- Events from the game server are received and added to a received_events field on the game client and processed by the application on every frame
+- Events, both ServerEvent and ClientEvent are enums defined in the server module  
 
 # Note
 - Do not use `cargo build` to check for errors, instead use the IDE's native error reporting to check if there are any errors.

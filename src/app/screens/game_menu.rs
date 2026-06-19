@@ -1,6 +1,6 @@
 use bevy::prelude::*;
 
-use crate::app::screens::game_state::AppState;
+use crate::app::screens::app_state::AppState;
 use crate::server::{create_game_server, is_game_server_running};
 
 /// Marks the root UI node of the menu screen, so it can be despawned on exit.

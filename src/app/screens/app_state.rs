@@ -7,5 +7,6 @@ pub enum AppState {
     #[default]
     Menu,
     JoinGame,
+    Lobby,
     Playing,
 }

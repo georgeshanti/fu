@@ -2,7 +2,7 @@ use std::{sync::{Arc, RwLock}, thread};
 
 use bevy::prelude::*;
 
-use crate::{app::{GameClientWrapper, common::text::{InputField, InputText, TextInputFocused}, screens::game_state::AppState}, client::GameClient, connection::client::create_client, server::{CLIENT_EVENT_SENDER, GAME_SERVER, is_game_server_running}};
+use crate::{app::{GameClientWrapper, common::text::{InputField, InputText, TextInputFocused}, screens::app_state::AppState}, client::GameClient, connection::client::create_client, server::{CLIENT_EVENT_SENDER, ClientEvent, GAME_SERVER, ServerEvent, is_game_server_running}};
 
 /// Marks the root UI node of the join-game screen, so it can be despawned on exit.
 #[derive(Component)]
@@ -43,7 +43,7 @@ pub fn setup_join_screen(mut commands: Commands) {
             // field's contents live in its `JoinInputField`; the child `Text`
             // (tagged `JoinInputText`) mirrors them for display. Fields are
             // `Button`s so clicks move keyboard focus between them.
-            for (label, focused) in [("Player Name", true), ("Game Code", false)] {
+            for (label, focused) in [("Game Code", true)] {
                 parent.spawn((
                     Text::new(label),
                     TextColor(Color::srgb(0.7, 0.7, 0.7)),
@@ -114,14 +114,16 @@ pub fn setup_join_screen(mut commands: Commands) {
 pub fn handle_join_online_submit_button(
     mut commands: Commands,
     interactions: Query<&Interaction, (Changed<Interaction>, With<JoinOnlineServerButton>)>,
+    input_field: Query<&InputField>,
     mut next_state: ResMut<NextState<AppState>>,
 ) {
     for interaction in &interactions {
         if *interaction == Interaction::Pressed {
+        let address = input_field.single().map(|field| field.value().to_string()).unwrap_or_default();
         let (game_client, sender) = GameClient::new();
         let game_client = GameClientWrapper{client: Arc::new(RwLock::new(game_client))};
 
-        let (request_sender, response_receiver) = create_client(String::from("127.0.0.1:8765"));
+        let (request_sender, response_receiver) = create_client::<ServerEvent, ClientEvent, u8>(address, None);
 
         game_client.client.write().unwrap().attach_sender(request_sender);
         thread::spawn(move || {
@@ -133,7 +135,7 @@ pub fn handle_join_online_submit_button(
 
         game_client.client.read().unwrap().start_client();
         commands.insert_resource(game_client);
-            next_state.set(AppState::Playing);
+            next_state.set(AppState::Lobby);
         }
     }
 }
@@ -146,15 +148,15 @@ pub fn handle_join_local_server_button(
 ) {
     for interaction in &interactions {
         if *interaction == Interaction::Pressed {
-        let (game_client, sender) = GameClient::new();
-        let game_client = GameClientWrapper{client: Arc::new(RwLock::new(game_client))};
-        {
-            GAME_SERVER.lock().unwrap().as_mut().unwrap().attach_sender(sender);
-        }
-        game_client.client.write().unwrap().attach_sender(CLIENT_EVENT_SENDER.lock().unwrap().as_ref().unwrap().clone());
-        game_client.client.read().unwrap().start_client();
-        commands.insert_resource(game_client);
-            next_state.set(AppState::Playing);
+            let (game_client, sender) = GameClient::new();
+            let game_client = GameClientWrapper{client: Arc::new(RwLock::new(game_client))};
+            {
+                GAME_SERVER.lock().unwrap().as_mut().unwrap().attach_sender(sender, None);
+            }
+            game_client.client.write().unwrap().attach_sender(CLIENT_EVENT_SENDER.lock().unwrap().as_ref().unwrap().clone());
+            game_client.client.read().unwrap().start_client();
+            commands.insert_resource(game_client);
+            next_state.set(AppState::Lobby);
         }
     }
 }

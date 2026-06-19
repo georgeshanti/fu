@@ -1,5 +1,6 @@
 use std::{net::TcpListener, sync::mpsc::{self, Receiver, Sender}, thread};
-use serde::{Serialize, de::DeserializeOwned};
+use bevy::ecs::event::Event;
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tungstenite::{accept, protocol::Role, Message, WebSocket};
 
 /// Starts a WebSocket server listening on port 8765 and spawns a thread
@@ -10,15 +11,23 @@ use tungstenite::{accept, protocol::Role, Message, WebSocket};
 /// request channel, and a writer that serializes `Response`s from a
 /// per-connection channel and sends them back over the socket. The sender half
 /// of that per-connection response channel is handed out on the client channel.
-pub fn create_server<Request, Response>()
-    -> (Receiver<Request>, Receiver<Sender<Response>>, Sender<()>)
+
+
+#[derive(Event, Debug, Clone, Serialize, Deserialize)]
+pub struct Handshake<Id> {
+    pub id: Option<Id>,
+}
+
+pub fn create_server<Request, Response, Id>()
+    -> (Receiver<Request>, Receiver<(Option<Id>, Sender<Response>)>, Sender<()>)
 where
     Request: DeserializeOwned + Send + 'static,
     Response: Serialize + Send + 'static,
+    Id: DeserializeOwned + Send + 'static,
 {
     let listener = TcpListener::bind("0.0.0.0:8765").expect("failed to bind to port 8765");
     let (request_sender, request_receiver) = mpsc::channel::<Request>();
-    let (client_sender, client_receiver) = mpsc::channel::<Sender<Response>>();
+    let (client_sender, client_receiver) = mpsc::channel::<(Option<Id>, Sender<Response>)>();
     let (kill_sender, _kill_receiver) = mpsc::channel::<()>();
     thread::spawn(move || {
         for stream in listener.incoming() {
@@ -27,6 +36,8 @@ where
                     // Perform the WebSocket handshake on the accepted TCP stream.
                     match accept(stream) {
                         Ok(websocket) => {
+
+
                             // Split the connection into independent read/write halves by
                             // cloning the underlying TCP stream (TCP is full-duplex).
                             let write_stream = match websocket.get_ref().try_clone() {
@@ -37,6 +48,22 @@ where
                                 }
                             };
                             let mut reader = websocket;
+
+                            let client_id = {
+                                match reader.read() {
+                                    Ok(Message::Text(txt)) => match serde_json::from_str::<Handshake<Id>>(&txt) {
+                                        Ok(req) => req.id,
+                                        Err(e) => {eprintln!("failed to deserialize request: {e}"); break;},
+                                    },
+                                    Ok(Message::Close(_)) => break,
+                                    Ok(_) => { break } // ignore binary/ping/pong for now
+                                    Err(e) => {
+                                        eprintln!("ws read error: {e}");
+                                        break;
+                                    }
+                                }
+                            };
+
                             let mut writer = WebSocket::from_raw_socket(write_stream, Role::Server, None);
 
                             // Per-connection response channel.
@@ -78,7 +105,7 @@ where
                             });
 
                             // Hand the response sender to the consumer.
-                            if client_sender.send(response_sender).is_err() {
+                            if client_sender.send((client_id, response_sender)).is_err() {
                                 break;
                             }
                         }

@@ -2,6 +2,8 @@ use std::{net::TcpStream, sync::mpsc::{self, Receiver, Sender}, thread};
 use serde::{Serialize, de::DeserializeOwned};
 use tungstenite::{connect, protocol::Role, stream::MaybeTlsStream, Message, WebSocket};
 
+use crate::connection::server::Handshake;
+
 /// Opens a WebSocket connection to `address` (expected as `hostname:port`) and
 /// spawns two threads to pump traffic in each direction.
 ///
@@ -10,11 +12,12 @@ use tungstenite::{connect, protocol::Role, stream::MaybeTlsStream, Message, WebS
 /// the request channel and sends them over the socket. The caller is handed the
 /// sender half of the request channel and the receiver half of the response
 /// channel, mirroring the abstraction exposed by `create_server`.
-pub fn create_client<Response, Request>(address: String)
+pub fn create_client<Response, Request, Id>(address: String, id: Option<Id>)
     -> (Sender<Request>, Receiver<Response>)
 where
     Request: Serialize + Send + 'static,
     Response: DeserializeOwned + Send + 'static,
+    Id: Serialize + Send + 'static,
 {
     let url = format!("ws://{address}");
     let (websocket, _response) = connect(&url).expect("failed to connect to server");
@@ -55,6 +58,14 @@ where
             }
         }
     });
+
+    let h = Handshake::<Id> {id: id};
+    match serde_json::to_string(&h) {
+        Ok(json) => {
+            writer.send(Message::Text(json));
+        }
+        Err(e) => eprintln!("failed to serialize request: {e}"),
+    }
 
     // Writer thread: request_receiver -> Request -> ws frame.
     thread::spawn(move || {
