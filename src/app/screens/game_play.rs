@@ -14,6 +14,13 @@ pub struct Player {
     pub last_direction_event_timestamp: std::time::SystemTime,
 }
 
+/// An L-shaped object held off a player's right side. Spawned as a child of the
+/// player and anchored at the point where it meets the cube (the right face);
+/// its two cuboid segments are children of this entity, positioned relative to
+/// that anchor.
+#[derive(Component)]
+pub struct LObject;
+
 /// Horizontal movement speed of the player, in meters per second.
 const PLAYER_SPEED: f32 = 5.0;
 
@@ -84,17 +91,55 @@ pub fn setup_game_play(
 
     // One dynamic cube per player, at the spawn point assigned by the server.
     if let Some(spawns) = spawns {
+        // Shared assets for the L-shaped object held off each player's right side.
+        // The L lies flat in the horizontal (X-Z) plane, thin in Y, at cube mid-height.
+        let l_spine_mesh = meshes.add(Cuboid::new(1.0, 0.1, 0.2));
+        let l_foot_mesh = meshes.add(Cuboid::new(0.2, 0.1, 0.8));
+        let l_material = materials.add(Color::srgb(0.7, 0.7, 0.7));
+
         for (player, position) in &spawns.0 {
-            commands.spawn((
-                Mesh3d(meshes.add(Cuboid::new(1.0, 1.0, 1.0))),
-                MeshMaterial3d(materials.add(Color::srgb(0.8, 0.3, 0.3))),
-                Transform::from_translation(*position),
-                RigidBody::Dynamic,
-                Collider::cuboid(1.0, 1.0, 1.0),
-                ConstantLinearAcceleration(Vec3::ZERO),
-                Player { player_id: player.id, direction: Vec3::ZERO, last_direction_event_timestamp: std::time::SystemTime::now() },
-            ));
-        }   
+            commands
+                .spawn((
+                    Mesh3d(meshes.add(Cuboid::new(1.0, 1.0, 1.0))),
+                    MeshMaterial3d(materials.add(Color::srgb(0.8, 0.3, 0.3))),
+                    Transform::from_translation(*position),
+                    RigidBody::Dynamic,
+                    Collider::cuboid(1.0, 1.0, 1.0),
+                    // Facing is driven manually (see `drain_server_events`); lock physics
+                    // rotation so collisions don't tumble the cube and fight that facing.
+                    LockedAxes::ROTATION_LOCKED,
+                    ConstantLinearAcceleration(Vec3::ZERO),
+                    Player { player_id: player.id, direction: Vec3::ZERO, last_direction_event_timestamp: std::time::SystemTime::now() },
+                ))
+                .with_children(|parent| {
+                    // The L as a single entity, anchored at the point where it meets the
+                    // cube (the right face, local x = 0.5). Its segments are positioned
+                    // relative to this anchor.
+                    parent
+                        .spawn((
+                            LObject,
+                            Transform::from_xyz(0.5, 0.0, 0.0),
+                            Visibility::default(),
+                        ))
+                        .with_children(|l| {
+                            // L spine: runs along +X out from the anchor (cube right face).
+                            l.spawn((
+                                Mesh3d(l_spine_mesh.clone()),
+                                MeshMaterial3d(l_material.clone()),
+                                Transform::from_xyz(0.5, 0.0, 0.0),
+                                Collider::cuboid(1.0, 0.1, 0.2),
+                            ));
+                            // L foot: turns in -Z at the outer end, forming the base of the L
+                            // (mirrored about the xy plane).
+                            l.spawn((
+                                Mesh3d(l_foot_mesh.clone()),
+                                MeshMaterial3d(l_material.clone()),
+                                Transform::from_xyz(0.9, 0.0, -0.3),
+                                Collider::cuboid(0.2, 0.1, 0.8),
+                            ));
+                        });
+                });
+        }
     }
 
     // Start the pre-game countdown; `PlayersSpawned` is sent once it elapses.
@@ -158,7 +203,7 @@ pub fn tick_countdown(
 pub fn drain_server_events(
     mut commands: Commands,
     client: Res<GameClientWrapper>,
-    mut query: Query<(&Player, &mut LinearVelocity, &mut ConstantLinearAcceleration)>,
+    mut query: Query<(&Player, &mut LinearVelocity, &mut ConstantLinearAcceleration, &mut Rotation)>,
     overlay: Query<Entity, With<CountdownOverlay>>,
     mut next_state: ResMut<NextState<AppState>>,
 ) {
@@ -172,11 +217,17 @@ pub fn drain_server_events(
     for event in events {
         match event {
             ServerEvent::Movement { player_id, x, y } => {
-                for (player, mut vel, mut accel) in &mut query {
+                for (player, mut vel, mut accel, mut rotation) in &mut query {
                     if player.player_id == player_id {
                         vel.x = x;
                         vel.z = y;
                         *accel = ConstantLinearAcceleration(Vec3::new(x, 0.0, y).normalize_or_zero() * PLAYER_ACCEL);
+                        // Point the player (and its anchored L) toward the movement
+                        // direction. Forward is -Z, so yaw = atan2(-x, -z). Leave the
+                        // facing unchanged when stationary.
+                        if Vec3::new(x, 0.0, y).length_squared() > 1e-6 {
+                            *rotation = Quat::from_rotation_y(f32::atan2(-x, -y)).into();
+                        }
                     }
                 }
             },
