@@ -10,6 +10,11 @@ use crate::{
     server::{ClientEvent, Controller, Player, ServerEvent},
 };
 
+/// Spawn assignments delivered by the server's `StartRound`, handed off to the
+/// `SpawningPlayers` state. Inserted by `update_lobby`; consumed by the spawning screen.
+#[derive(Resource)]
+pub struct PendingSpawns(pub Vec<(Player, Vec3)>);
+
 /// Marks the root UI node of the lobby screen, so it can be despawned on exit.
 #[derive(Component)]
 pub struct LobbyRoot;
@@ -34,7 +39,7 @@ pub struct LobbyNameField;
 #[derive(Component)]
 pub struct LobbyJoinButton;
 
-/// Marks the "Start Game" button on the lobby screen. Currently inert.
+/// Marks the "Start Game" button on the lobby screen.
 #[derive(Component)]
 pub struct LobbyStartButton;
 
@@ -237,6 +242,7 @@ pub fn update_lobby(
     client: Res<GameClientWrapper>,
     container: Query<Entity, With<PlayerListContainer>>,
     rows: Query<Entity, With<PlayerRow>>,
+    mut next_state: ResMut<NextState<AppState>>,
 ) {
     let events = {
         let client = client.client.read().unwrap();
@@ -247,41 +253,48 @@ pub fn update_lobby(
     };
 
     for event in events {
-        if let ServerEvent::LobbyInfo { players } = event {
-            // Update this client's own player list: the roster entries whose
-            // `client_id` matches this client's assigned id.
-            {
-                let client = client.client.read().unwrap();
-                if let Some(own_id) = *client.client_id.read().unwrap() {
-                    let mine = players
-                        .iter()
-                        .filter(|p| p.client_id == own_id)
-                        .map(|p| ClientPlayer { id: p.id, name: p.name.clone(), controller: p.controller })
-                        .collect();
-                    *client.players.write().unwrap() = mine;
+        match event {
+            ServerEvent::LobbyInfo { players } => {
+                // Update this client's own player list: the roster entries whose
+                // `client_id` matches this client's assigned id.
+                {
+                    let client = client.client.read().unwrap();
+                    if let Some(own_id) = *client.client_id.read().unwrap() {
+                        let mine = players
+                            .iter()
+                            .filter(|p| p.client_id == own_id)
+                            .map(|p| ClientPlayer { id: p.id, name: p.name.clone(), controller: p.controller })
+                            .collect();
+                        *client.players.write().unwrap() = mine;
+                    }
                 }
-            }
 
-            // Clear the previous roster, then render the latest one.
-            for row in &rows {
-                commands.entity(row).despawn();
+                // Clear the previous roster, then render the latest one.
+                for row in &rows {
+                    commands.entity(row).despawn();
+                }
+                let Ok(container) = container.single() else {
+                    continue;
+                };
+                for Player { id, client_id, name, controller } in players {
+                    let row = commands
+                        .spawn((
+                            Text::new(format!(
+                                "{name}  (#{id}, client {client_id}) — {}",
+                                controller_label(controller)
+                            )),
+                            TextColor(Color::WHITE),
+                            PlayerRow,
+                        ))
+                        .id();
+                    commands.entity(container).add_child(row);
+                }
+            },
+            ServerEvent::SpawnPlayers { spawns } => {
+                commands.insert_resource(PendingSpawns(spawns));
+                next_state.set(AppState::SpawningPlayers);
             }
-            let Ok(container) = container.single() else {
-                continue;
-            };
-            for Player { id, client_id, name, controller } in players {
-                let row = commands
-                    .spawn((
-                        Text::new(format!(
-                            "{name}  (#{id}, client {client_id}) — {}",
-                            controller_label(controller)
-                        )),
-                        TextColor(Color::WHITE),
-                        PlayerRow,
-                    ))
-                    .id();
-                commands.entity(container).add_child(row);
-            }
+            _ => {},
         }
     }
 }
@@ -468,6 +481,21 @@ pub fn handle_lobby_join_button(
             };
             if let Some(sender) = &client_guard.sender {
                 sender.send(ClientEvent::JoinLobby { client_id, name: name.to_string(), controller }).ok();
+            }
+        }
+    }
+}
+
+/// Emits a `GameStart` event when the "Start Game" button is pressed.
+pub fn handle_lobby_start_button(
+    interactions: Query<&Interaction, (Changed<Interaction>, With<LobbyStartButton>)>,
+    client: Res<GameClientWrapper>,
+) {
+    for interaction in &interactions {
+        if *interaction == Interaction::Pressed {
+            let client_guard = client.client.read().unwrap();
+            if let Some(sender) = &client_guard.sender {
+                sender.send(ClientEvent::StartGame).ok();
             }
         }
     }

@@ -8,5 +8,6 @@ pub enum AppState {
     Menu,
     JoinGame,
     Lobby,
+    SpawningPlayers,
     Playing,
 }

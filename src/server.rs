@@ -66,6 +66,10 @@ pub enum ServerEvent {
     LobbyInfo { players: Vec<Player> },
     /// Sent to a freshly-connected client to inform it of its assigned id.
     ClientRegistered { client_id: u8 },
+    /// Round is starting; carries each player and their initial spawn location.
+    SpawnPlayers { spawns: Vec<(Player, Vec3)> },
+    /// Players have been spawned by all clients and now the round may start.
+    StartRound,
 }
 
 /// Events originating from a client, sent to the server.
@@ -76,6 +80,10 @@ pub enum ClientEvent {
     JoinLobby { client_id: u8, name: String, controller: Controller },
     /// Asks the server to reply with the current lobby roster (`LobbyInfo`).
     FetchLobby,
+    /// Asks the server to begin the round (sent from the lobby "Start Game" button).
+    StartGame,
+    /// Sent once a client has finished spawning the platform and its players.
+    PlayersSpawned { client_id: u8 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -94,11 +102,13 @@ pub struct Player {
 
 /// Server-side hub: maintains game state
 pub struct GameServer {
-    pub phase: GamePhase,
+    pub phase: Arc<Mutex<GamePhase>>,
     pub players: Arc<Mutex<Vec<Player>>>,
     /// Senders keyed by client id, used to push events out to each client.
     /// The tuple's first element is the next-id counter.
     pub clients: Arc<Mutex<(u8, BTreeMap<u8, Sender<ServerEvent>>)>>,
+    /// Client ids that have reported PlayersSpawned for the current round.
+    pub pending_client_starts: Arc<Mutex<Vec<u8>>>,
     /// Channel of inbound events arriving from clients.
     pub receiver: Arc<Mutex<Receiver<ClientEvent>>>,
 }
@@ -107,9 +117,10 @@ impl GameServer {
     pub fn new() -> (Self, Sender<ClientEvent>) {
         let (sender, receiver) = mpsc::channel();
         let server = GameServer {
-            phase: GamePhase::Lobby,
+            phase: Arc::new(Mutex::new(GamePhase::Lobby)),
             players: Arc::new(Mutex::new(Vec::new())),
             clients: Arc::new(Mutex::new((0, BTreeMap::new()))),
+            pending_client_starts: Arc::new(Mutex::new(Vec::new())),
             receiver: Arc::new(Mutex::new(receiver)),
         };
         (server, sender)
@@ -134,11 +145,14 @@ impl GameServer {
         let receiver = self.receiver.clone();
         let clients = self.clients.clone();
         let players = self.players.clone();
+        let phase = self.phase.clone();
+        let pending_client_starts = self.pending_client_starts.clone();
         thread::spawn(move || {
             let receiver = receiver.lock().unwrap();
             loop {
                 let event = receiver.recv().unwrap();
                 let clients = clients.lock().unwrap();
+                println!("Got client event: {:?}", event);
                 match event {
                     ClientEvent::Movement{player_id, x, y} => {
                         for client in clients.1.values() {
@@ -160,6 +174,37 @@ impl GameServer {
                         let roster = players.lock().unwrap().clone();
                         for client in clients.1.values() {
                             let _ = client.send(ServerEvent::LobbyInfo { players: roster.clone() });
+                        }
+                    }
+                    ClientEvent::StartGame => {
+                        *phase.lock().unwrap() = GamePhase::RoundStarting;
+                        pending_client_starts.lock().unwrap().clear();
+                        let roster = players.lock().unwrap().clone();
+                        let n = roster.len();
+                        let spawns: Vec<(Player, Vec3)> = roster
+                            .into_iter()
+                            .enumerate()
+                            .map(|(i, player)| {
+                                // Evenly spaced along the X axis, 2 units apart, centered on origin.
+                                let x = (i as f32 - (n as f32 - 1.0) / 2.0) * 2.0;
+                                (player, Vec3::new(x, 6.0, 0.0))
+                            })
+                            .collect();
+                        for client in clients.1.values() {
+                            let _ = client.send(ServerEvent::SpawnPlayers { spawns: spawns.clone() });
+                        }
+                    }
+                    ClientEvent::PlayersSpawned { client_id } => {
+                        let mut pending = pending_client_starts.lock().unwrap();
+                        if !pending.contains(&client_id) {
+                            pending.push(client_id);
+                        }
+                        if pending.len() >= clients.1.len() {
+                            *phase.lock().unwrap() = GamePhase::RoundPlaying;
+                            for client in clients.1.values() {
+                                let _ = client.send(ServerEvent::StartRound);
+                            }
+                            pending.clear();
                         }
                     }
                 }
