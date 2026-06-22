@@ -11,10 +11,18 @@ use crate::{
 pub struct Player {
     pub player_id: u8,
     pub direction: Vec3,
+    pub last_direction_event_timestamp: std::time::SystemTime,
 }
 
 /// Horizontal movement speed of the player, in meters per second.
 const PLAYER_SPEED: f32 = 5.0;
+
+/// Minimum time between movement events when direction is unchanged (keep-alive heartbeat), in seconds.
+const DIRECTION_EVENT_INTERVAL: u128 = 50;
+
+/// Quantization factor for joystick axes: 2^7 / 2 = 64 levels per side,
+/// giving 128 discrete steps across the clamped -1..1 range.
+const DIRECTION_QUANTIZATION: f32 = 128.0;
 
 /// Seconds to wait (showing the countdown overlay) before telling the server we're ready.
 const COUNTDOWN_SECS: f32 = 3.0;
@@ -84,7 +92,7 @@ pub fn setup_game_play(
                 RigidBody::Dynamic,
                 Collider::cuboid(1.0, 1.0, 1.0),
                 ConstantLinearAcceleration(Vec3::ZERO),
-                Player { player_id: player.id, direction: Vec3::ZERO },
+                Player { player_id: player.id, direction: Vec3::ZERO, last_direction_event_timestamp: std::time::SystemTime::now() },
             ));
         }   
     }
@@ -197,8 +205,10 @@ pub fn move_player(
     keyboard: Res<ButtonInput<KeyCode>>,
     gamepads: Query<(Entity, &Gamepad)>,
     client: Res<GameClientWrapper>,
+    time: Res<Time>,
     mut query: Query<&mut Player>,
 ) {
+
     // Snapshot this client's local roster (player_id -> controller), releasing the
     // lock before we touch the ECS.
     let roster: Vec<(u8, Controller)> = {
@@ -232,19 +242,29 @@ pub fn move_player(
     for (entity, gamepad) in &gamepads {
         let controller = Controller::Gamepad(entity.index().index());
         if let Some((id, _)) = roster.iter().find(|(_, c)| *c == controller) {
-            let stick = gamepad.left_stick() + gamepad.dpad(); // x = right, y = up
-            let direction = Vec3::new(stick.x, 0.0, -stick.y); // stick up = forward = -z
-            moves.push((*id, direction.clamp_length_max(1.0) * PLAYER_SPEED));
+            let stick = (gamepad.left_stick() + gamepad.dpad()).clamp_length_max(1.0); // x = right, y = up
+            // Round each axis to the closest 7-bit level (128 steps over -1..1) so stick
+            // jitter collapses to a stable value instead of flooding Movement events.
+            let x = (stick.x * DIRECTION_QUANTIZATION).round() / DIRECTION_QUANTIZATION;
+            let y = (stick.y * DIRECTION_QUANTIZATION).round() / DIRECTION_QUANTIZATION;
+            let direction = Vec3::new(x, 0.0, -y); // stick up = forward = -z
+            moves.push((*id, direction * PLAYER_SPEED));
         }
     }
 
-    // Apply: route each velocity to its player entity, sending only on change.
+    // Apply: route each velocity to its player entity, sending only when the
+    // direction changed or the keep-alive interval has elapsed since the last event.
     for (player_id, velocity) in moves {
         for mut player in &mut query {
-            if player.player_id == player_id && player.direction != velocity {
-                player.direction = velocity;
-                if let Some(sender) = &client.client.read().unwrap().sender {
-                    sender.send(ClientEvent::Movement { player_id, x: velocity.x, y: velocity.z }).ok();
+            if player.player_id == player_id {
+                let direction_changed = player.direction != velocity;
+                let interval_elapsed = player.last_direction_event_timestamp.elapsed().unwrap().as_millis() >= DIRECTION_EVENT_INTERVAL;
+                if direction_changed || interval_elapsed {
+                    player.direction = velocity;
+                    player.last_direction_event_timestamp = std::time::SystemTime::now();
+                    if let Some(sender) = &client.client.read().unwrap().sender {
+                        sender.send(ClientEvent::Movement { player_id, x: velocity.x, y: velocity.z }).ok();
+                    }
                 }
             }
         }
