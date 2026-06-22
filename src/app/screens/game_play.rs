@@ -3,7 +3,7 @@ use bevy::prelude::*;
 
 use crate::{
     app::{GameClientWrapper, screens::{app_state::AppState, lobby::PendingSpawns}},
-    server::{ClientEvent, ServerEvent},
+    server::{ClientEvent, Controller, ServerEvent},
 };
 
 /// Identifies an entity as a player-controlled body.
@@ -188,31 +188,64 @@ pub fn drain_server_events(
 
 /// Reads WASD/Gamepad input and drives the player's horizontal velocity, leaving the
 /// vertical component to gravity / the physics solver.
+///
+/// Each local player picked a `Controller` in the lobby (`Keyboard` or a specific
+/// `Gamepad`). We read every active input source, look up which local player it is
+/// assigned to, and send a `Movement` event for that player's real id. The keyboard
+/// is digital (full speed); the gamepad stick is analog (speed scales with tilt).
 pub fn move_player(
     keyboard: Res<ButtonInput<KeyCode>>,
+    gamepads: Query<(Entity, &Gamepad)>,
     client: Res<GameClientWrapper>,
     mut query: Query<&mut Player>,
 ) {
-    let mut direction = Vec3::ZERO;
-    if keyboard.pressed(KeyCode::KeyW) {
-        direction.z -= 1.0; // forward, away from the camera
-    }
-    if keyboard.pressed(KeyCode::KeyS) {
-        direction.z += 1.0; // back
-    }
-    if keyboard.pressed(KeyCode::KeyA) {
-        direction.x -= 1.0; // left
-    }
-    if keyboard.pressed(KeyCode::KeyD) {
-        direction.x += 1.0; // right
+    // Snapshot this client's local roster (player_id -> controller), releasing the
+    // lock before we touch the ECS.
+    let roster: Vec<(u8, Controller)> = {
+        let client = client.client.read().unwrap();
+        let players = client.players.read().unwrap();
+        players.iter().map(|p| (p.id, p.controller)).collect()
+    };
+
+    // Collect the velocity each active controller wants for its assigned player.
+    let mut moves: Vec<(u8, Vec3)> = Vec::new();
+
+    // Keyboard (WASD): digital, normalized to full speed.
+    if let Some((id, _)) = roster.iter().find(|(_, c)| *c == Controller::Keyboard) {
+        let mut direction = Vec3::ZERO;
+        if keyboard.pressed(KeyCode::KeyW) {
+            direction.z -= 1.0; // forward, away from the camera
+        }
+        if keyboard.pressed(KeyCode::KeyS) {
+            direction.z += 1.0; // back
+        }
+        if keyboard.pressed(KeyCode::KeyA) {
+            direction.x -= 1.0; // left
+        }
+        if keyboard.pressed(KeyCode::KeyD) {
+            direction.x += 1.0; // right
+        }
+        moves.push((*id, direction.normalize_or_zero() * PLAYER_SPEED));
     }
 
-    let velocity = direction.normalize_or_zero() * PLAYER_SPEED;
-    for mut player in &mut query {
-        if player.direction != velocity {
-            player.direction = velocity;
-            if let Some(sender) = &client.client.read().unwrap().sender {
-                sender.send(ClientEvent::Movement { player_id: 0, x: velocity.x, y: velocity.z }).ok();
+    // Gamepads: left stick + d-pad, analog (speed proportional to tilt, capped).
+    for (entity, gamepad) in &gamepads {
+        let controller = Controller::Gamepad(entity.index().index());
+        if let Some((id, _)) = roster.iter().find(|(_, c)| *c == controller) {
+            let stick = gamepad.left_stick() + gamepad.dpad(); // x = right, y = up
+            let direction = Vec3::new(stick.x, 0.0, -stick.y); // stick up = forward = -z
+            moves.push((*id, direction.clamp_length_max(1.0) * PLAYER_SPEED));
+        }
+    }
+
+    // Apply: route each velocity to its player entity, sending only on change.
+    for (player_id, velocity) in moves {
+        for mut player in &mut query {
+            if player.player_id == player_id && player.direction != velocity {
+                player.direction = velocity;
+                if let Some(sender) = &client.client.read().unwrap().sender {
+                    sender.send(ClientEvent::Movement { player_id, x: velocity.x, y: velocity.z }).ok();
+                }
             }
         }
     }
