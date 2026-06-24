@@ -19,7 +19,23 @@ pub struct Player {
 /// its two cuboid segments are children of this entity, positioned relative to
 /// that anchor.
 #[derive(Component)]
-pub struct LObject;
+pub struct Boomerang;
+
+/// Total duration of one swing (forward and back), in seconds.
+const SWING_DURATION: f32 = 0.25;
+
+/// Peak yaw of the swing. The spine rests along local +X and must reach the cube
+/// front (local -Z). For `Quat::from_rotation_y(θ)`, local +X maps to
+/// (cos θ, 0, -sin θ); reaching (0,0,-1) requires θ = +π/2. (A negative angle would
+/// swing to the cube's back, +Z — wrong.)
+const SWING_PEAK_ANGLE: f32 = std::f32::consts::FRAC_PI_2;
+
+/// Present on an `LObject` only while a swing is animating; tracks elapsed time.
+/// Removed (and rotation snapped to rest) when `elapsed >= SWING_DURATION`.
+#[derive(Component)]
+pub struct Swinging {
+    elapsed: f32,
+}
 
 /// Horizontal movement speed of the player, in meters per second.
 const PLAYER_SPEED: f32 = 5.0;
@@ -29,7 +45,7 @@ const DIRECTION_EVENT_INTERVAL: u128 = 50;
 
 /// Quantization factor for joystick axes: 2^7 / 2 = 64 levels per side,
 /// giving 128 discrete steps across the clamped -1..1 range.
-const DIRECTION_QUANTIZATION: f32 = 128.0;
+const DIRECTION_QUANTIZATION: f32 = 32.0;
 
 /// Seconds to wait (showing the countdown overlay) before telling the server we're ready.
 const COUNTDOWN_SECS: f32 = 3.0;
@@ -100,11 +116,11 @@ pub fn setup_game_play(
         for (player, position) in &spawns.0 {
             commands
                 .spawn((
-                    Mesh3d(meshes.add(Cuboid::new(1.0, 1.0, 1.0))),
+                    Mesh3d(meshes.add(Cylinder::new(0.5, 1.0))),
                     MeshMaterial3d(materials.add(Color::srgb(0.8, 0.3, 0.3))),
                     Transform::from_translation(*position),
                     RigidBody::Dynamic,
-                    Collider::cuboid(1.0, 1.0, 1.0),
+                    Collider::cylinder(0.5, 1.0),
                     // Facing is driven manually (see `drain_server_events`); lock physics
                     // rotation so collisions don't tumble the cube and fight that facing.
                     LockedAxes::ROTATION_LOCKED,
@@ -117,7 +133,7 @@ pub fn setup_game_play(
                     // relative to this anchor.
                     parent
                         .spawn((
-                            LObject,
+                            Boomerang,
                             Transform::from_xyz(0.5, 0.0, 0.0),
                             Visibility::default(),
                         ))
@@ -318,6 +334,57 @@ pub fn move_player(
                     }
                 }
             }
+        }
+    }
+}
+
+/// On a gamepad West-button (left action) press, start a forward swing on the pressing
+/// player's `LObject`. Reuses the same gamepad→player roster mapping as `move_player`.
+/// A press while a swing is already in flight is a no-op (the `Without<Swinging>` filter).
+pub fn start_swing(
+    mut commands: Commands,
+    gamepads: Query<(Entity, &Gamepad)>,
+    client: Res<GameClientWrapper>,
+    players: Query<(&Player, &Children)>,
+    lobjects: Query<(), (With<Boomerang>, Without<Swinging>)>,
+) {
+    let roster: Vec<(u8, Controller)> = {
+        let client = client.client.read().unwrap();
+        let players = client.players.read().unwrap();
+        players.iter().map(|p| (p.id, p.controller)).collect()
+    };
+    for (entity, gamepad) in &gamepads {
+        if !gamepad.just_pressed(GamepadButton::West) { continue; }
+        let controller = Controller::Gamepad(entity.index().index());
+        let Some((id, _)) = roster.iter().find(|(_, c)| *c == controller) else { continue; };
+        for (player, children) in &players {
+            if player.player_id != *id { continue; }
+            for child in children.iter() {
+                if lobjects.get(child).is_ok() {
+                    commands.entity(child).insert(Swinging { elapsed: 0.0 });
+                }
+            }
+        }
+    }
+}
+
+/// Advance any in-flight `LObject` swings, writing the local yaw, and end them when done.
+/// A `sin(π·t)` arch eases the spine out to the cube front (local -Z) and back to rest
+/// over `SWING_DURATION`, so one timer drives both strokes.
+pub fn animate_swing(
+    mut commands: Commands,
+    time: Res<Time>,
+    mut query: Query<(Entity, &mut Transform, &mut Swinging), With<Boomerang>>,
+) {
+    for (entity, mut transform, mut swing) in &mut query {
+        swing.elapsed += time.delta_secs();
+        let t = (swing.elapsed / SWING_DURATION).clamp(0.0, 1.0);
+        let angle = SWING_PEAK_ANGLE * (std::f32::consts::PI * t).sin();
+        transform.rotation = Quat::from_rotation_y(angle); // translation (0.5,0,0) untouched
+        transform.translation = Vec3 { x: angle.cos() * 0.5, y: 0.0, z: angle.sin()*-0.5 };
+        if swing.elapsed >= SWING_DURATION {
+            transform.rotation = Quat::IDENTITY; // snap exactly to rest
+            commands.entity(entity).remove::<Swinging>();
         }
     }
 }
