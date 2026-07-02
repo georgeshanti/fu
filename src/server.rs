@@ -70,6 +70,8 @@ pub enum ServerEvent {
     SpawnPlayers { spawns: Vec<(Player, Vec3)> },
     /// Players have been spawned by all clients and now the round may start.
     StartRound,
+    /// A player has been struck and is now dead; clients should kill that player.
+    PlayerStriked { player_id: u8 },
 }
 
 /// Events originating from a client, sent to the server.
@@ -84,6 +86,8 @@ pub enum ClientEvent {
     StartGame,
     /// Sent once a client has finished spawning the platform and its players.
     PlayersSpawned { client_id: u8 },
+    /// A striker's boomerang hit another player; carries both player ids.
+    StrikePlayer { striker_id: u8, struck_id: u8 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -98,6 +102,7 @@ pub struct Player {
     pub client_id: u8,
     pub name: String,
     pub controller: Controller,
+    pub alive: bool,
 }
 
 /// Server-side hub: maintains game state
@@ -163,7 +168,7 @@ impl GameServer {
                         let roster = {
                             let mut players = players.lock().unwrap();
                             let id = players.len() as u8;
-                            players.push(Player { id, client_id, name, controller });
+                            players.push(Player { id, client_id, name, controller, alive: true });
                             players.clone()
                         };
                         for client in clients.1.values() {
@@ -205,6 +210,23 @@ impl GameServer {
                                 let _ = client.send(ServerEvent::StartRound);
                             }
                             pending.clear();
+                        }
+                    }
+                    ClientEvent::StrikePlayer { struck_id, .. } => {
+                        // Only relay on the alive->dead transition, so the many
+                        // collision events a single swing produces collapse to one
+                        // PlayerStriked broadcast.
+                        let relay = {
+                            let mut players = players.lock().unwrap();
+                            match players.iter_mut().find(|p| p.id == struck_id) {
+                                Some(p) if p.alive => { p.alive = false; true }
+                                _ => false,
+                            }
+                        };
+                        if relay {
+                            for client in clients.1.values() {
+                                let _ = client.send(ServerEvent::PlayerStriked { player_id: struck_id });
+                            }
                         }
                     }
                 }

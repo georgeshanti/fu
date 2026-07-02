@@ -63,7 +63,16 @@ pub fn run() {
         )
         .add_systems(
             Update,
-            (move_player, start_swing, animate_swing, drain_server_events)
+            (
+                move_player,
+                start_swing,
+                animate_swing,
+                tick_swing_cooldown,
+                detect_strikes,
+                apply_dead_collision_layers,
+                animate_death,
+                drain_server_events,
+            )
                 .run_if(in_state(AppState::Playing)),
         )
         .run();

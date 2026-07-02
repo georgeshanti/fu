@@ -276,7 +276,7 @@ pub fn update_lobby(
                 let Ok(container) = container.single() else {
                     continue;
                 };
-                for Player { id, client_id, name, controller } in players {
+                for Player { id, client_id, name, controller, .. } in players {
                     let row = commands
                         .spawn((
                             Text::new(format!(

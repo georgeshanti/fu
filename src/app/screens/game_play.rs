@@ -21,6 +21,32 @@ pub struct Player {
 #[derive(Component)]
 pub struct Boomerang;
 
+/// Marks a collider entity as a boomerang blade segment (the L spine/foot).
+#[derive(Component)]
+pub struct BoomerangBlade;
+
+/// Present on a player once struck; drives the shrink animation. Never removed —
+/// a dead player stays on the field at half size.
+#[derive(Component)]
+pub struct Dead {
+    elapsed: f32,
+}
+
+/// Physics collision layers. Living players and their blades stay on the implicit
+/// `Default` layer; the platform gets its own layer so a `Dead` body can filter to
+/// touch only the platform (and thus pass through every other player and boomerang).
+#[derive(PhysicsLayer, Default, Clone, Copy)]
+enum GameLayer {
+    #[default]
+    Default,
+    Platform,
+    Dead,
+}
+
+/// Total duration of the death shrink, in seconds, and the scale a dead body settles at.
+const DEATH_DURATION: f32 = 0.4;
+const DEAD_SCALE: f32 = 0.5;
+
 /// Total duration of one swing (forward and back), in seconds.
 const SWING_DURATION: f32 = 0.25;
 
@@ -35,6 +61,16 @@ const SWING_PEAK_ANGLE: f32 = std::f32::consts::FRAC_PI_2;
 #[derive(Component)]
 pub struct Swinging {
     elapsed: f32,
+}
+
+/// Minimum delay after a swing ends before the player may swing again.
+const SWING_COOLDOWN: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Present on a player from when their swing ends until `SWING_COOLDOWN` has elapsed.
+/// While present it blocks `start_swing`; `tick_swing_cooldown` removes it once expired.
+#[derive(Component)]
+pub struct SwingCooldown {
+    until: std::time::SystemTime,
 }
 
 /// Horizontal movement speed of the player, in meters per second.
@@ -103,6 +139,8 @@ pub fn setup_game_play(
         MeshMaterial3d(materials.add(Color::srgb(0.3, 0.5, 0.3))),
         RigidBody::Static,
         Collider::cuboid(20.0, 0.01, 20.0),
+        // Own layer so dead bodies can filter to collide with only the platform.
+        CollisionLayers::new(GameLayer::Platform, LayerMask::ALL),
     ));
 
     // One dynamic cube per player, at the spawn point assigned by the server.
@@ -144,6 +182,8 @@ pub fn setup_game_play(
                                 MeshMaterial3d(l_material.clone()),
                                 Transform::from_xyz(0.5, 0.0, 0.0),
                                 Collider::cuboid(1.0, 0.1, 0.2),
+                                BoomerangBlade,
+                                CollisionEventsEnabled,
                             ));
                             // L foot: turns in -Z at the outer end, forming the base of the L
                             // (mirrored about the xy plane).
@@ -152,6 +192,8 @@ pub fn setup_game_play(
                                 MeshMaterial3d(l_material.clone()),
                                 Transform::from_xyz(0.9, 0.0, -0.3),
                                 Collider::cuboid(0.2, 0.1, 0.8),
+                                BoomerangBlade,
+                                CollisionEventsEnabled,
                             ));
                         });
                 });
@@ -219,7 +261,7 @@ pub fn tick_countdown(
 pub fn drain_server_events(
     mut commands: Commands,
     client: Res<GameClientWrapper>,
-    mut query: Query<(&Player, &mut LinearVelocity, &mut ConstantLinearAcceleration, &mut Rotation)>,
+    mut query: Query<(Entity, &Player, &mut LinearVelocity, &mut ConstantLinearAcceleration, &mut Rotation), Without<Dead>>,
     overlay: Query<Entity, With<CountdownOverlay>>,
     mut next_state: ResMut<NextState<AppState>>,
 ) {
@@ -233,7 +275,7 @@ pub fn drain_server_events(
     for event in events {
         match event {
             ServerEvent::Movement { player_id, x, y } => {
-                for (player, mut vel, mut accel, mut rotation) in &mut query {
+                for (_entity, player, mut vel, mut accel, mut rotation) in &mut query {
                     if player.player_id == player_id {
                         vel.x = x;
                         vel.z = y;
@@ -255,6 +297,15 @@ pub fn drain_server_events(
                 commands.remove_resource::<Countdown>();
                 next_state.set(AppState::Playing);
             }
+            ServerEvent::PlayerStriked { player_id } => {
+                // Mark the struck player dead; `animate_death` shrinks it and
+                // `apply_dead_collision_layers` relayers it to touch only the platform.
+                for (entity, player, ..) in &query {
+                    if player.player_id == player_id {
+                        commands.entity(entity).insert(Dead { elapsed: 0.0 });
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -273,7 +324,7 @@ pub fn move_player(
     gamepads: Query<(Entity, &Gamepad)>,
     client: Res<GameClientWrapper>,
     time: Res<Time>,
-    mut query: Query<&mut Player>,
+    mut query: Query<&mut Player, Without<Dead>>,
 ) {
 
     // Snapshot this client's local roster (player_id -> controller), releasing the
@@ -345,7 +396,7 @@ pub fn start_swing(
     mut commands: Commands,
     gamepads: Query<(Entity, &Gamepad)>,
     client: Res<GameClientWrapper>,
-    players: Query<(&Player, &Children)>,
+    players: Query<(&Player, &Children), Without<SwingCooldown>>,
     lobjects: Query<(), (With<Boomerang>, Without<Swinging>)>,
 ) {
     let roster: Vec<(u8, Controller)> = {
@@ -374,9 +425,9 @@ pub fn start_swing(
 pub fn animate_swing(
     mut commands: Commands,
     time: Res<Time>,
-    mut query: Query<(Entity, &mut Transform, &mut Swinging), With<Boomerang>>,
+    mut query: Query<(Entity, &mut Transform, &mut Swinging, &ChildOf), With<Boomerang>>,
 ) {
-    for (entity, mut transform, mut swing) in &mut query {
+    for (entity, mut transform, mut swing, child_of) in &mut query {
         swing.elapsed += time.delta_secs();
         let t = (swing.elapsed / SWING_DURATION).clamp(0.0, 1.0);
         let angle = SWING_PEAK_ANGLE * (std::f32::consts::PI * t).sin();
@@ -385,6 +436,115 @@ pub fn animate_swing(
         if swing.elapsed >= SWING_DURATION {
             transform.rotation = Quat::IDENTITY; // snap exactly to rest
             commands.entity(entity).remove::<Swinging>();
+            // Start the player's swing cooldown from the moment the swing ends.
+            commands.entity(child_of.parent()).insert(SwingCooldown {
+                until: std::time::SystemTime::now() + SWING_COOLDOWN,
+            });
         }
+    }
+}
+
+/// Removes a player's `SwingCooldown` once `SWING_COOLDOWN` has elapsed since their last
+/// swing ended, letting them swing again.
+pub fn tick_swing_cooldown(
+    mut commands: Commands,
+    cooldowns: Query<(Entity, &SwingCooldown)>,
+) {
+    let now = std::time::SystemTime::now();
+    for (entity, cooldown) in &cooldowns {
+        if now >= cooldown.until {
+            commands.entity(entity).remove::<SwingCooldown>();
+        }
+    }
+}
+
+/// Detects boomerang strikes. While a boomerang is mid-swing, a contact between one of
+/// its blade segments and another player's body is a strike. `CollisionStart` already
+/// reports each collider's rigid body, so the blade's body is the striker and the other
+/// body is the struck player. Only the client that owns the striker sends the event, so
+/// the server sees one `StrikePlayer` per strike rather than one per simulating client.
+pub fn detect_strikes(
+    mut collisions: MessageReader<CollisionStart>,
+    client: Res<GameClientWrapper>,
+    players: Query<&Player>,
+    blades: Query<&ChildOf, With<BoomerangBlade>>,
+    swinging: Query<(), With<Swinging>>,
+) {
+    // Snapshot which player ids this client controls locally.
+    let local_ids: Vec<u8> = {
+        let client = client.client.read().unwrap();
+        let players = client.players.read().unwrap();
+        players.iter().map(|p| p.id).collect()
+    };
+
+    for event in collisions.read() {
+        // Exactly one collider must be a blade. Neither -> a body-to-body bump;
+        // both -> boomerang vs boomerang. Neither is a strike.
+        let blade1 = blades.get(event.collider1).ok();
+        let blade2 = blades.get(event.collider2).ok();
+        let (blade_child_of, blade_body, other_body) = match (blade1, blade2) {
+            (Some(c), None) => (c, event.body1, event.body2),
+            (None, Some(c)) => (c, event.body2, event.body1),
+            _ => continue,
+        };
+
+        // Swing gate: the blade's parent boomerang must be mid-swing.
+        if swinging.get(blade_child_of.parent()).is_err() {
+            continue;
+        }
+
+        let (Some(blade_body), Some(other_body)) = (blade_body, other_body) else { continue; };
+        let (Ok(striker), Ok(struck)) = (players.get(blade_body), players.get(other_body)) else {
+            continue;
+        };
+        if striker.player_id == struck.player_id {
+            continue;
+        }
+
+        // Only the striker's owning client reports the strike.
+        if !local_ids.contains(&striker.player_id) {
+            continue;
+        }
+
+        if let Some(sender) = &client.client.read().unwrap().sender {
+            sender
+                .send(ClientEvent::StrikePlayer {
+                    striker_id: striker.player_id,
+                    struck_id: struck.player_id,
+                })
+                .ok();
+        }
+    }
+}
+
+/// When a player is newly marked `Dead`, relayer its body and blade colliders onto the
+/// `Dead` layer (filtering to the `Platform` only) so the dead body still rests on the
+/// floor but passes through every other player and boomerang. The hierarchy is fixed
+/// depth-2 (player -> Boomerang -> blades), so we walk it directly.
+pub fn apply_dead_collision_layers(
+    newly_dead: Query<(Entity, &Children), Added<Dead>>,
+    boomerangs: Query<&Children, With<Boomerang>>,
+    mut commands: Commands,
+) {
+    let dead_layers = CollisionLayers::new(GameLayer::Dead, GameLayer::Platform);
+    for (body, children) in &newly_dead {
+        commands.entity(body).insert(dead_layers);
+        for &child in children {
+            if let Ok(blades) = boomerangs.get(child) {
+                for &blade in blades {
+                    commands.entity(blade).insert(dead_layers);
+                }
+            }
+        }
+    }
+}
+
+/// Shrinks a dead player's body from full size down to `DEAD_SCALE` over `DEATH_DURATION`
+/// and holds it there. The `Dead` marker is never removed, so the body stays on the field.
+pub fn animate_death(time: Res<Time>, mut query: Query<(&mut Transform, &mut Dead)>) {
+    for (mut transform, mut dead) in &mut query {
+        dead.elapsed += time.delta_secs();
+        let t = (dead.elapsed / DEATH_DURATION).clamp(0.0, 1.0);
+        transform.scale = Vec3::splat(1.0 - t * (1.0 - DEAD_SCALE));
     }
 }
