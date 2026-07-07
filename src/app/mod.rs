@@ -59,7 +59,7 @@ pub fn run() {
         .add_systems(OnEnter(AppState::SpawningPlayers), setup_game_play)
         .add_systems(
             Update,
-            (tick_countdown, drain_server_events).run_if(in_state(AppState::SpawningPlayers)),
+            (tick_countdown, wait_for_start).run_if(in_state(AppState::SpawningPlayers)),
         )
         .add_systems(
             Update,
@@ -71,9 +71,12 @@ pub fn run() {
                 detect_strikes,
                 apply_dead_collision_layers,
                 animate_death,
-                drain_server_events,
             )
                 .run_if(in_state(AppState::Playing)),
+        )
+        .add_systems(
+            FixedUpdate,
+            (drain_server_events).run_if(in_state(AppState::Playing))
         )
         .run();
 }

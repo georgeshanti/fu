@@ -71,7 +71,6 @@ enum GamePhase {
 /// Events originating from the server, sent out to clients.
 #[derive(Event, Debug, Clone, Serialize, Deserialize)]
 pub enum ServerEvent {
-    Movement { player_id: u8, x: f32, y: f32 },
     /// Roster of every player currently connected to the game server.
     LobbyInfo { players: Vec<Player> },
     /// Sent to a freshly-connected client to inform it of its assigned id.
@@ -80,14 +79,12 @@ pub enum ServerEvent {
     SpawnPlayers { spawns: Vec<(Player, Vec3)> },
     /// Players have been spawned by all clients and now the round may start.
     StartRound,
-    /// A player has been struck and is now dead; clients should kill that player.
-    PlayerStriked { player_id: u8 },
+    GameEvent {tick: u64, game_event: GameEvent},
 }
 
 /// Events originating from a client, sent to the server.
 #[derive(Event, Debug, Clone, Serialize, Deserialize)]
 pub enum ClientEvent {
-    Movement { player_id: u8, x: f32, y: f32 },
     /// Registers a player with the given name and chosen input controller.
     JoinLobby { client_id: u8, name: String, controller: Controller },
     /// Asks the server to reply with the current lobby roster (`LobbyInfo`).
@@ -96,6 +93,14 @@ pub enum ClientEvent {
     StartGame,
     /// Sent once a client has finished spawning the platform and its players.
     PlayersSpawned { client_id: u8 },
+    GameEvent {tick: u64, game_event: GameEvent}
+}
+
+#[derive(Event, Debug, Clone, Serialize, Deserialize)]
+pub enum GameEvent{
+    Movement { player_id: u8, x: f32, y: f32 },
+    /// A player pressed their swing input; starts a boomerang swing for that player.
+    Swing { player_id: u8 },
     /// A striker's boomerang hit another player; carries both player ids.
     StrikePlayer { striker_id: u8, struck_id: u8 },
 }
@@ -169,11 +174,6 @@ impl GameServer {
                 let clients = clients.lock().unwrap();
                 println!("Got client event: {:?}", event);
                 match event {
-                    ClientEvent::Movement{player_id, x, y} => {
-                        for client in clients.1.values() {
-                            let _ = client.send(ServerEvent::Movement { player_id, x, y });
-                        }
-                    }
                     ClientEvent::JoinLobby { client_id, name, controller } => {
                         let roster = {
                             let mut players = players.lock().unwrap();
@@ -222,20 +222,34 @@ impl GameServer {
                             pending.clear();
                         }
                     }
-                    ClientEvent::StrikePlayer { struck_id, .. } => {
-                        // Only relay on the alive->dead transition, so the many
-                        // collision events a single swing produces collapse to one
-                        // PlayerStriked broadcast.
-                        let relay = {
-                            let mut players = players.lock().unwrap();
-                            match players.iter_mut().find(|p| p.id == struck_id) {
-                                Some(p) if p.alive => { p.alive = false; true }
-                                _ => false,
+                    ClientEvent::GameEvent { tick, game_event } => {
+                        match game_event {
+                            GameEvent::Movement{player_id, x, y} => {
+                                for client in clients.1.values() {
+                                    let _ = client.send(ServerEvent::GameEvent { tick, game_event: GameEvent::Movement { player_id, x, y }});
+                                }
                             }
-                        };
-                        if relay {
-                            for client in clients.1.values() {
-                                let _ = client.send(ServerEvent::PlayerStriked { player_id: struck_id });
+                            GameEvent::Swing { player_id } => {
+                                for client in clients.1.values() {
+                                    let _ = client.send(ServerEvent::GameEvent { tick, game_event: GameEvent::Swing { player_id }});
+                                }
+                            }
+                            GameEvent::StrikePlayer { struck_id, striker_id } => {
+                                // Only relay on the alive->dead transition, so the many
+                                // collision events a single swing produces collapse to one
+                                // PlayerStriked broadcast.
+                                let relay = {
+                                    let mut players = players.lock().unwrap();
+                                    match players.iter_mut().find(|p| p.id == struck_id) {
+                                        Some(p) if p.alive => { p.alive = false; true }
+                                        _ => false,
+                                    }
+                                };
+                                if relay {
+                                    for client in clients.1.values() {
+                                        let _ = client.send(ServerEvent::GameEvent {tick, game_event: GameEvent::StrikePlayer { struck_id, striker_id }});
+                                    }
+                                }
                             }
                         }
                     }

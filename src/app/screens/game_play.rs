@@ -2,8 +2,7 @@ use avian3d::prelude::*;
 use bevy::prelude::*;
 
 use crate::{
-    app::{GameClientWrapper, screens::{app_state::AppState, lobby::PendingSpawns}},
-    server::{ClientEvent, Controller, ServerEvent},
+    app::{GameClientWrapper, screens::{app_state::AppState, lobby::PendingSpawns}}, server::{ClientEvent, GameEvent, Controller, ServerEvent},
 };
 
 /// Identifies an entity as a player-controlled body.
@@ -81,7 +80,7 @@ const DIRECTION_EVENT_INTERVAL: u128 = 50;
 
 /// Quantization factor for joystick axes: 2^7 / 2 = 64 levels per side,
 /// giving 128 discrete steps across the clamped -1..1 range.
-const DIRECTION_QUANTIZATION: f32 = 32.0;
+const DIRECTION_QUANTIZATION: f32 = 4.0;
 
 /// Seconds to wait (showing the countdown overlay) before telling the server we're ready.
 const COUNTDOWN_SECS: f32 = 3.0;
@@ -91,6 +90,23 @@ const COUNTDOWN_SECS: f32 = 3.0;
 pub struct Countdown {
     remaining: f32,
 }
+
+/// Counts `drain_server_events` invocations. Present only while `AppState::Playing`;
+/// stamped onto outgoing `ClientEvent::GameEvent`s in place of the old hardcoded `tick: 0`.
+#[derive(Resource, Default)]
+pub struct Ticker(pub u64);
+
+/// One outgoing `GameEvent` this client has sent to the server, paired with the
+/// `Ticker` value it was stamped with.
+pub struct SentGameEvent {
+    pub tick: u64,
+    pub event: GameEvent,
+}
+
+/// Every `GameEvent` this client has transmitted so far. Present only while
+/// `AppState::Playing` (inserted alongside `Ticker`).
+#[derive(Resource, Default)]
+pub struct SentGameEvents(pub Vec<SentGameEvent>);
 
 /// Root node of the countdown overlay (despawned when the countdown ends).
 #[derive(Component)]
@@ -258,10 +274,9 @@ pub fn tick_countdown(
     }
 }
 
-pub fn drain_server_events(
+pub fn wait_for_start(
     mut commands: Commands,
     client: Res<GameClientWrapper>,
-    mut query: Query<(Entity, &Player, &mut LinearVelocity, &mut ConstantLinearAcceleration, &mut Rotation), Without<Dead>>,
     overlay: Query<Entity, With<CountdownOverlay>>,
     mut next_state: ResMut<NextState<AppState>>,
 ) {
@@ -273,40 +288,77 @@ pub fn drain_server_events(
         events
     };
     for event in events {
-        match event {
-            ServerEvent::Movement { player_id, x, y } => {
-                for (_entity, player, mut vel, mut accel, mut rotation) in &mut query {
-                    if player.player_id == player_id {
-                        vel.x = x;
-                        vel.z = y;
-                        *accel = ConstantLinearAcceleration(Vec3::new(x, 0.0, y).normalize_or_zero() * PLAYER_ACCEL);
-                        // Point the player (and its anchored L) toward the movement
-                        // direction. Forward is -Z, so yaw = atan2(-x, -z). Leave the
-                        // facing unchanged when stationary.
-                        if Vec3::new(x, 0.0, y).length_squared() > 1e-6 {
-                            *rotation = Quat::from_rotation_y(f32::atan2(-x, -y)).into();
+        if let ServerEvent::StartRound = event {
+            // Countdown finished: tell the server we're ready and remove the overlay.
+            for entity in &overlay {
+                commands.entity(entity).despawn();
+            }
+            commands.remove_resource::<Countdown>();
+            commands.insert_resource(Ticker(0));
+            commands.insert_resource(SentGameEvents::default());
+            next_state.set(AppState::Playing);
+        }
+    }
+}
+
+pub fn drain_server_events(
+    mut commands: Commands,
+    client: Res<GameClientWrapper>,
+    mut query: Query<(Entity, &Player, &mut LinearVelocity, &mut ConstantLinearAcceleration, &mut Rotation), Without<Dead>>,
+    swing_targets: Query<(&Player, &Children), Without<Dead>>,
+    lobjects: Query<Entity, (With<Boomerang>, Without<Swinging>)>,
+    overlay: Query<Entity, With<CountdownOverlay>>,
+    mut next_state: ResMut<NextState<AppState>>,
+    mut ticker: ResMut<Ticker>,
+) {
+    ticker.0 += 1;
+
+    let client = client.client.read().unwrap();
+    let events = {
+        let mut server_events = client.received_events.lock().unwrap();
+        let events = server_events.clone();
+        *server_events = vec![];
+        events
+    };
+    for event in events {
+        if let ServerEvent::GameEvent { tick, game_event: game_event } = event {
+            match game_event {
+                GameEvent::Movement { player_id, x, y } => {
+                    for (_entity, player, mut vel, mut accel, mut rotation) in &mut query {
+                        if player.player_id == player_id {
+                            vel.x = x;
+                            vel.z = y;
+                            *accel = ConstantLinearAcceleration(Vec3::new(x, 0.0, y).normalize_or_zero() * PLAYER_ACCEL);
+                            // Point the player (and its anchored L) toward the movement
+                            // direction. Forward is -Z, so yaw = atan2(-x, -z). Leave the
+                            // facing unchanged when stationary.
+                            if Vec3::new(x, 0.0, y).length_squared() > 1e-6 {
+                                *rotation = Quat::from_rotation_y(f32::atan2(-x, -y)).into();
+                            }
+                        }
+                    }
+                },
+                GameEvent::Swing { player_id } => {
+                    for (player, children) in &swing_targets {
+                        if player.player_id != player_id { continue; }
+                        for child in children.iter() {
+                            if let Ok(boomerang) = lobjects.get(child) {
+                                commands.entity(boomerang).insert(Swinging { elapsed: 0.0 });
+                            }
                         }
                     }
                 }
-            },
-            ServerEvent::StartRound => {
-                // Countdown finished: tell the server we're ready and remove the overlay.
-                for entity in &overlay {
-                    commands.entity(entity).despawn();
-                }
-                commands.remove_resource::<Countdown>();
-                next_state.set(AppState::Playing);
-            }
-            ServerEvent::PlayerStriked { player_id } => {
-                // Mark the struck player dead; `animate_death` shrinks it and
-                // `apply_dead_collision_layers` relayers it to touch only the platform.
-                for (entity, player, ..) in &query {
-                    if player.player_id == player_id {
-                        commands.entity(entity).insert(Dead { elapsed: 0.0 });
+                GameEvent::StrikePlayer { struck_id, .. } => {
+                    // Mark the struck player dead; `animate_death` shrinks it and
+                    // `apply_dead_collision_layers` relayers it to touch only the platform.
+                    for (entity, player, ..) in &query {
+                        if player.player_id == struck_id {
+                            commands.entity(entity).insert(Dead { elapsed: 0.0 });
+                        }
                     }
                 }
+                _ => {}
             }
-            _ => {}
         }
     }
 }
@@ -324,6 +376,8 @@ pub fn move_player(
     gamepads: Query<(Entity, &Gamepad)>,
     client: Res<GameClientWrapper>,
     time: Res<Time>,
+    ticker: Res<Ticker>,
+    mut sent_events: ResMut<SentGameEvents>,
     mut query: Query<&mut Player, Without<Dead>>,
 ) {
 
@@ -376,12 +430,15 @@ pub fn move_player(
         for mut player in &mut query {
             if player.player_id == player_id {
                 let direction_changed = player.direction != velocity;
-                let interval_elapsed = player.last_direction_event_timestamp.elapsed().unwrap().as_millis() >= DIRECTION_EVENT_INTERVAL;
+                // let interval_elapsed = player.last_direction_event_timestamp.elapsed().unwrap().as_millis() >= DIRECTION_EVENT_INTERVAL;
+                let interval_elapsed = false;
                 if direction_changed || interval_elapsed {
                     player.direction = velocity;
                     player.last_direction_event_timestamp = std::time::SystemTime::now();
                     if let Some(sender) = &client.client.read().unwrap().sender {
-                        sender.send(ClientEvent::Movement { player_id, x: velocity.x, y: velocity.z }).ok();
+                        let game_event = GameEvent::Movement { player_id, x: velocity.x, y: velocity.z };
+                        sent_events.0.push(SentGameEvent { tick: ticker.0, event: game_event.clone() });
+                        sender.send(ClientEvent::GameEvent { tick: ticker.0, game_event }).ok();
                     }
                 }
             }
@@ -394,10 +451,11 @@ pub fn move_player(
 /// roster mapping as `move_player`. A press while a swing is already in flight is a
 /// no-op (the `Without<Swinging>` filter).
 pub fn start_swing(
-    mut commands: Commands,
     keyboard: Res<ButtonInput<KeyCode>>,
     gamepads: Query<(Entity, &Gamepad)>,
     client: Res<GameClientWrapper>,
+    ticker: Res<Ticker>,
+    mut sent_events: ResMut<SentGameEvents>,
     players: Query<(&Player, &Children), Without<SwingCooldown>>,
     lobjects: Query<(), (With<Boomerang>, Without<Swinging>)>,
 ) {
@@ -412,7 +470,14 @@ pub fn start_swing(
                 if player.player_id != *id { continue; }
                 for child in children.iter() {
                     if lobjects.get(child).is_ok() {
-                        commands.entity(child).insert(Swinging { elapsed: 0.0 });
+                        if let Some(sender) = &client.client.read().unwrap().sender {
+                            let game_event = GameEvent::Swing { player_id: *id };
+                            sent_events.0.push(SentGameEvent { tick: ticker.0, event: game_event.clone() });
+                            sender.send(ClientEvent::GameEvent {
+                                tick: ticker.0,
+                                game_event,
+                            }).ok();
+                        }
                     }
                 }
             }
@@ -426,7 +491,14 @@ pub fn start_swing(
             if player.player_id != *id { continue; }
             for child in children.iter() {
                 if lobjects.get(child).is_ok() {
-                    commands.entity(child).insert(Swinging { elapsed: 0.0 });
+                    if let Some(sender) = &client.client.read().unwrap().sender {
+                        let game_event = GameEvent::Swing { player_id: *id };
+                        sent_events.0.push(SentGameEvent { tick: ticker.0, event: game_event.clone() });
+                        sender.send(ClientEvent::GameEvent {
+                            tick: ticker.0,
+                            game_event,
+                        }).ok();
+                    }
                 }
             }
         }
@@ -483,6 +555,8 @@ pub fn detect_strikes(
     players: Query<&Player>,
     blades: Query<&ChildOf, With<BoomerangBlade>>,
     swinging: Query<(), With<Swinging>>,
+    ticker: Res<Ticker>,
+    mut sent_events: ResMut<SentGameEvents>,
 ) {
     // Snapshot which player ids this client controls locally.
     let local_ids: Vec<u8> = {
@@ -521,11 +595,13 @@ pub fn detect_strikes(
         }
 
         if let Some(sender) = &client.client.read().unwrap().sender {
+            let game_event = GameEvent::StrikePlayer {
+                striker_id: striker.player_id,
+                struck_id: struck.player_id,
+            };
+            sent_events.0.push(SentGameEvent { tick: ticker.0, event: game_event.clone() });
             sender
-                .send(ClientEvent::StrikePlayer {
-                    striker_id: striker.player_id,
-                    struck_id: struck.player_id,
-                })
+                .send(ClientEvent::GameEvent { tick: ticker.0, game_event })
                 .ok();
         }
     }
