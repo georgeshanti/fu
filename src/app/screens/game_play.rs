@@ -338,19 +338,19 @@ pub fn move_player(
     // Collect the velocity each active controller wants for its assigned player.
     let mut moves: Vec<(u8, Vec3)> = Vec::new();
 
-    // Keyboard (WASD): digital, normalized to full speed.
+    // Keyboard (arrow keys): digital, normalized to full speed.
     if let Some((id, _)) = roster.iter().find(|(_, c)| *c == Controller::Keyboard) {
         let mut direction = Vec3::ZERO;
-        if keyboard.pressed(KeyCode::KeyW) {
+        if keyboard.pressed(KeyCode::ArrowUp) {
             direction.z -= 1.0; // forward, away from the camera
         }
-        if keyboard.pressed(KeyCode::KeyS) {
+        if keyboard.pressed(KeyCode::ArrowDown) {
             direction.z += 1.0; // back
         }
-        if keyboard.pressed(KeyCode::KeyA) {
+        if keyboard.pressed(KeyCode::ArrowLeft) {
             direction.x -= 1.0; // left
         }
-        if keyboard.pressed(KeyCode::KeyD) {
+        if keyboard.pressed(KeyCode::ArrowRight) {
             direction.x += 1.0; // right
         }
         moves.push((*id, direction.normalize_or_zero() * PLAYER_SPEED));
@@ -389,11 +389,13 @@ pub fn move_player(
     }
 }
 
-/// On a gamepad West-button (left action) press, start a forward swing on the pressing
-/// player's `LObject`. Reuses the same gamepad→player roster mapping as `move_player`.
-/// A press while a swing is already in flight is a no-op (the `Without<Swinging>` filter).
+/// On a gamepad West-button (left action) press, or the keyboard's Z key, start a
+/// forward swing on the pressing player's `LObject`. Reuses the same controller→player
+/// roster mapping as `move_player`. A press while a swing is already in flight is a
+/// no-op (the `Without<Swinging>` filter).
 pub fn start_swing(
     mut commands: Commands,
+    keyboard: Res<ButtonInput<KeyCode>>,
     gamepads: Query<(Entity, &Gamepad)>,
     client: Res<GameClientWrapper>,
     players: Query<(&Player, &Children), Without<SwingCooldown>>,
@@ -404,6 +406,18 @@ pub fn start_swing(
         let players = client.players.read().unwrap();
         players.iter().map(|p| (p.id, p.controller)).collect()
     };
+    if keyboard.just_pressed(KeyCode::KeyZ) {
+        if let Some((id, _)) = roster.iter().find(|(_, c)| *c == Controller::Keyboard) {
+            for (player, children) in &players {
+                if player.player_id != *id { continue; }
+                for child in children.iter() {
+                    if lobjects.get(child).is_ok() {
+                        commands.entity(child).insert(Swinging { elapsed: 0.0 });
+                    }
+                }
+            }
+        }
+    }
     for (entity, gamepad) in &gamepads {
         if !gamepad.just_pressed(GamepadButton::West) { continue; }
         let controller = Controller::Gamepad(entity.index().index());

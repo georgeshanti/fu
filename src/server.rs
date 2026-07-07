@@ -46,6 +46,16 @@ pub fn create_game_server() {
     GAME_SERVER.lock().unwrap().as_mut().unwrap().start_server();
 }
 
+/// Entry point for `--server`: starts the game server and blocks the main
+/// thread forever, since all server work happens on background threads.
+pub fn run_dedicated_server() {
+    create_game_server();
+    println!("Dedicated server listening on 0.0.0.0:8765");
+    loop {
+        thread::park();
+    }
+}
+
 /// Returns `true` if a game server instance currently exists in the global slot.
 pub fn is_game_server_running() -> bool {
     GAME_SERVER.lock().unwrap().is_some()

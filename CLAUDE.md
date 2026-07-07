@@ -73,8 +73,8 @@ One client can own several players (couch co-op): each lobby join picks a `Contr
   counter; player ids are assigned as `players.len()` on `JoinLobby`.
 - Client `AppState` ≠ server `GamePhase` (`Lobby/RoundStarting/RoundPlaying/RoundEnded`).
   `RoundEnded` is defined but never set — there is no win/round-reset flow yet.
-- Swing input is currently **gamepad-only** (`GamepadButton::West`); keyboard players can move
-  (WASD) but cannot swing.
+- Swing input: `GamepadButton::West` for gamepad players, `KeyCode::KeyZ` for keyboard.
+  Keyboard movement uses the arrow keys (not WASD).
 - Known cruft, intentionally untouched: debug `println!`s (`"Here1"`, `"Got client event"`, …),
   unused imports in `main.rs`, the `extract-cargo-expoorts.sh` filename typo.
 

@@ -8,5 +8,9 @@ mod connection;
 mod server;
 
 fn main() {
-    app::run();
+    if std::env::args().any(|arg| arg == "--server") {
+        server::run_dedicated_server();
+    } else {
+        app::run();
+    }
 }
