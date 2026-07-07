@@ -1,0 +1,220 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Dedicated server for the game "fu". Runs the released linux binary with
+  --server on a single EC2 instance behind an Elastic IP, listening on
+  ws://<EIP>:8765 (plain WebSocket, no TLS). Self-contained: creates its own
+  minimal VPC. Admin access is via SSM Session Manager (no SSH, no port 22).
+
+Parameters:
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    Description: >-
+      EC2 instance type. The server is a lightweight JSON relay (no physics,
+      no rendering), so a micro instance is plenty.
+
+  BinaryUrl:
+    Type: String
+    Default: https://github.com/georgeshanti/fu/releases/latest/download/fu-linux-x86_64
+    Description: >-
+      URL of the fu linux binary to run. Defaults to the latest GitHub
+      release; pin a tag (e.g. .../download/v0.0.5/fu-linux-x86_64) for
+      reproducible deploys.
+
+  AllowedCidr:
+    Type: String
+    Default: 0.0.0.0/0
+    AllowedPattern: ^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$
+    Description: CIDR range allowed to connect to the game port (TCP 8765).
+
+  # Lets you tear the server down (stop paying for compute) with a stack
+  # update instead of deleting the stack. The Elastic IP is kept, so the
+  # address players use survives re-enabling.
+  CreateInstance:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: >-
+      Whether to create the game server EC2 instance. Set to "false" to tear
+      the server down while keeping the stack and its Elastic IP.
+
+  # The release binary is built on GitHub's ubuntu-latest (Ubuntu 24.04), so
+  # the host must be Ubuntu 24.04 too — older glibc (e.g. Amazon Linux 2023)
+  # cannot load it. This SSM parameter always resolves to Canonical's current
+  # 24.04 AMI for the deploying region.
+  UbuntuAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id
+    Description: Ubuntu 24.04 AMI id (resolved from the public SSM parameter).
+
+Conditions:
+  ShouldCreateInstance: !Equals [!Ref CreateInstance, "true"]
+
+Resources:
+  # --- Networking: minimal single-subnet public VPC ---
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/24
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-vpc
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.0.0/28
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-public
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-igw
+
+  GatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+
+  DefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttachment
+    Properties:
+      RouteTableId: !Ref RouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  SubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref RouteTable
+
+  # --- Security: only the game port is reachable ---
+  GameSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: fu game server - WebSocket port only
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8765
+          ToPort: 8765
+          CidrIp: !Ref AllowedCidr
+          Description: fu game WebSocket (ws://)
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+          Description: binary download, apt, SSM
+
+  # --- IAM: SSM Session Manager access (Ubuntu 24.04 ships the SSM agent) ---
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref InstanceRole
+
+  # --- The game server ---
+  GameServerInstance:
+    Type: AWS::EC2::Instance
+    Condition: ShouldCreateInstance
+    # UserData downloads the binary on first boot, which needs internet access.
+    DependsOn: DefaultRoute
+    Properties:
+      ImageId: !Ref UbuntuAmiId
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref InstanceProfile
+      SubnetId: !Ref PublicSubnet
+      SecurityGroupIds:
+        - !Ref GameSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-server
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euo pipefail
+
+          # The binary links Bevy's full default feature set (audio, input,
+          # windowing) even though --server never uses them, so the loader
+          # needs these shared libs present.
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y libasound2t64 libudev1 libwayland-client0 libxkbcommon0
+
+          useradd --system --home-dir /opt/fu --shell /usr/sbin/nologin fu || true
+          mkdir -p /opt/fu
+          curl -fsSL --retry 5 -o /opt/fu/fu "${BinaryUrl}"
+          chmod +x /opt/fu/fu
+          chown -R fu:fu /opt/fu
+
+          cat > /etc/systemd/system/fu.service <<'EOF'
+          [Unit]
+          Description=fu dedicated game server (ws://0.0.0.0:8765)
+          After=network-online.target
+          Wants=network-online.target
+
+          [Service]
+          ExecStart=/opt/fu/fu --server
+          User=fu
+          Restart=always
+          RestartSec=2
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+
+          systemctl daemon-reload
+          systemctl enable --now fu
+
+  # Stable address that survives instance stop/start.
+  PublicIp:
+    Type: AWS::EC2::EIP
+    DependsOn: GatewayAttachment
+    Properties:
+      Domain: vpc
+      InstanceId: !If [ShouldCreateInstance, !Ref GameServerInstance, !Ref AWS::NoValue]
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-eip
+
+Outputs:
+  PublicIp:
+    Description: Public (Elastic) IP of the game server
+    Value: !Ref PublicIp
+
+  ServerAddress:
+    Description: Address players enter in the Join Game screen
+    Value: !Sub ws://${PublicIp}:8765
+
+  SsmSessionCommand:
+    Condition: ShouldCreateInstance
+    Description: Open an admin shell on the instance (needs AWS CLI + Session Manager plugin)
+    Value: !Sub aws ssm start-session --target ${GameServerInstance} --region ${AWS::Region}
