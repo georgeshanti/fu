@@ -96,17 +96,43 @@ pub struct Countdown {
 #[derive(Resource, Default)]
 pub struct Ticker(pub u64);
 
-/// One outgoing `GameEvent` this client has sent to the server, paired with the
-/// `Ticker` value it was stamped with.
-pub struct SentGameEvent {
-    pub tick: u64,
-    pub event: GameEvent,
+/// A snapshot of one locally-controlled player's physics at a given tick.
+#[derive(Clone)]
+pub struct PlayerState {
+    pub player_id: u8,
+    pub position: Vec3,
+    pub velocity: Vec3,
+    pub rotation: Quat,
 }
 
-/// Every `GameEvent` this client has transmitted so far. Present only while
+/// One tick of this client's local simulation: a snapshot of every locally-controlled
+/// player's physics, paired with whichever `GameEvent` (if any) was sent to the server
+/// that tick. Tagged with the `Ticker` value it was recorded at.
+pub struct SentGameEvent {
+    pub tick: u64,
+    pub event: (Vec<PlayerState>, Option<GameEvent>),
+}
+
+/// One entry per tick of local simulation recorded so far. Present only while
 /// `AppState::Playing` (inserted alongside `Ticker`).
 #[derive(Resource, Default)]
 pub struct SentGameEvents(pub Vec<SentGameEvent>);
+
+/// Snapshots the physics of every player in `local_ids` for the `SentGameEvents` ledger.
+fn snapshot_local_players<'a>(
+    local_ids: &[u8],
+    players: impl Iterator<Item = (&'a Player, &'a Transform, &'a LinearVelocity, &'a Rotation)>,
+) -> Vec<PlayerState> {
+    players
+        .filter(|(player, ..)| local_ids.contains(&player.player_id))
+        .map(|(player, transform, velocity, rotation)| PlayerState {
+            player_id: player.player_id,
+            position: transform.translation,
+            velocity: velocity.0,
+            rotation: rotation.0,
+        })
+        .collect()
+}
 
 /// Root node of the countdown overlay (despawned when the countdown ends).
 #[derive(Component)]
@@ -378,7 +404,7 @@ pub fn move_player(
     time: Res<Time>,
     ticker: Res<Ticker>,
     mut sent_events: ResMut<SentGameEvents>,
-    mut query: Query<&mut Player, Without<Dead>>,
+    mut query: Query<(&mut Player, &Transform, &LinearVelocity, &Rotation), Without<Dead>>,
 ) {
 
     // Snapshot this client's local roster (player_id -> controller), releasing the
@@ -388,6 +414,8 @@ pub fn move_player(
         let players = client.players.read().unwrap();
         players.iter().map(|p| (p.id, p.controller)).collect()
     };
+    let local_ids: Vec<u8> = roster.iter().map(|(id, _)| *id).collect();
+    let snapshot = snapshot_local_players(&local_ids, query.iter());
 
     // Collect the velocity each active controller wants for its assigned player.
     let mut moves: Vec<(u8, Vec3)> = Vec::new();
@@ -427,7 +455,7 @@ pub fn move_player(
     // Apply: route each velocity to its player entity, sending only when the
     // direction changed or the keep-alive interval has elapsed since the last event.
     for (player_id, velocity) in moves {
-        for mut player in &mut query {
+        for (mut player, ..) in &mut query {
             if player.player_id == player_id {
                 let direction_changed = player.direction != velocity;
                 // let interval_elapsed = player.last_direction_event_timestamp.elapsed().unwrap().as_millis() >= DIRECTION_EVENT_INTERVAL;
@@ -437,7 +465,7 @@ pub fn move_player(
                     player.last_direction_event_timestamp = std::time::SystemTime::now();
                     if let Some(sender) = &client.client.read().unwrap().sender {
                         let game_event = GameEvent::Movement { player_id, x: velocity.x, y: velocity.z };
-                        sent_events.0.push(SentGameEvent { tick: ticker.0, event: game_event.clone() });
+                        sent_events.0.push(SentGameEvent { tick: ticker.0, event: (snapshot.clone(), Some(game_event.clone())) });
                         sender.send(ClientEvent::GameEvent { tick: ticker.0, game_event }).ok();
                     }
                 }
@@ -458,12 +486,15 @@ pub fn start_swing(
     mut sent_events: ResMut<SentGameEvents>,
     players: Query<(&Player, &Children), Without<SwingCooldown>>,
     lobjects: Query<(), (With<Boomerang>, Without<Swinging>)>,
+    state_query: Query<(&Player, &Transform, &LinearVelocity, &Rotation)>,
 ) {
     let roster: Vec<(u8, Controller)> = {
         let client = client.client.read().unwrap();
         let players = client.players.read().unwrap();
         players.iter().map(|p| (p.id, p.controller)).collect()
     };
+    let local_ids: Vec<u8> = roster.iter().map(|(id, _)| *id).collect();
+    let snapshot = snapshot_local_players(&local_ids, state_query.iter());
     if keyboard.just_pressed(KeyCode::KeyZ) {
         if let Some((id, _)) = roster.iter().find(|(_, c)| *c == Controller::Keyboard) {
             for (player, children) in &players {
@@ -472,7 +503,7 @@ pub fn start_swing(
                     if lobjects.get(child).is_ok() {
                         if let Some(sender) = &client.client.read().unwrap().sender {
                             let game_event = GameEvent::Swing { player_id: *id };
-                            sent_events.0.push(SentGameEvent { tick: ticker.0, event: game_event.clone() });
+                            sent_events.0.push(SentGameEvent { tick: ticker.0, event: (snapshot.clone(), Some(game_event.clone())) });
                             sender.send(ClientEvent::GameEvent {
                                 tick: ticker.0,
                                 game_event,
@@ -493,7 +524,7 @@ pub fn start_swing(
                 if lobjects.get(child).is_ok() {
                     if let Some(sender) = &client.client.read().unwrap().sender {
                         let game_event = GameEvent::Swing { player_id: *id };
-                        sent_events.0.push(SentGameEvent { tick: ticker.0, event: game_event.clone() });
+                        sent_events.0.push(SentGameEvent { tick: ticker.0, event: (snapshot.clone(), Some(game_event.clone())) });
                         sender.send(ClientEvent::GameEvent {
                             tick: ticker.0,
                             game_event,
@@ -557,6 +588,7 @@ pub fn detect_strikes(
     swinging: Query<(), With<Swinging>>,
     ticker: Res<Ticker>,
     mut sent_events: ResMut<SentGameEvents>,
+    state_query: Query<(&Player, &Transform, &LinearVelocity, &Rotation)>,
 ) {
     // Snapshot which player ids this client controls locally.
     let local_ids: Vec<u8> = {
@@ -564,6 +596,7 @@ pub fn detect_strikes(
         let players = client.players.read().unwrap();
         players.iter().map(|p| p.id).collect()
     };
+    let snapshot = snapshot_local_players(&local_ids, state_query.iter());
 
     for event in collisions.read() {
         // Exactly one collider must be a blade. Neither -> a body-to-body bump;
@@ -599,7 +632,7 @@ pub fn detect_strikes(
                 striker_id: striker.player_id,
                 struck_id: struck.player_id,
             };
-            sent_events.0.push(SentGameEvent { tick: ticker.0, event: game_event.clone() });
+            sent_events.0.push(SentGameEvent { tick: ticker.0, event: (snapshot.clone(), Some(game_event.clone())) });
             sender
                 .send(ClientEvent::GameEvent { tick: ticker.0, game_event })
                 .ok();
@@ -637,4 +670,28 @@ pub fn animate_death(time: Res<Time>, mut query: Query<(&mut Transform, &mut Dea
         let t = (dead.elapsed / DEATH_DURATION).clamp(0.0, 1.0);
         transform.scale = Vec3::splat(1.0 - t * (1.0 - DEAD_SCALE));
     }
+}
+
+/// Records a `SentGameEvent` for the current tick if `move_player`/`start_swing`/
+/// `detect_strikes` didn't already log one (i.e. no `GameEvent` was sent this tick).
+/// Must run after those three systems so `sent_events`'s last tick reflects whether
+/// they fired this frame.
+pub fn record_tick_state(
+    client: Res<GameClientWrapper>,
+    ticker: Res<Ticker>,
+    mut sent_events: ResMut<SentGameEvents>,
+    state_query: Query<(&Player, &Transform, &LinearVelocity, &Rotation)>,
+) {
+    if sent_events.0.last().map(|e| e.tick) == Some(ticker.0) {
+        return;
+    }
+    let local_ids: Vec<u8> = {
+        let client = client.client.read().unwrap();
+        let players = client.players.read().unwrap();
+        players.iter().map(|p| p.id).collect()
+    };
+    sent_events.0.push(SentGameEvent {
+        tick: ticker.0,
+        event: (snapshot_local_players(&local_ids, state_query.iter()), None),
+    });
 }
