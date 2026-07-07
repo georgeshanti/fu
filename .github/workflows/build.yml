@@ -15,14 +15,17 @@ jobs:
             runner: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             bin: fu
+            ext: ""
           - name: macos-aarch64
             runner: macos-14
             target: aarch64-apple-darwin
             bin: fu
+            ext: ""
           - name: windows-x86_64
             runner: windows-latest
             target: x86_64-pc-windows-msvc
             bin: fu.exe
+            ext: .exe
     steps:
       - uses: actions/checkout@v4
 
@@ -46,9 +49,36 @@ jobs:
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
 
+      - name: Rename binary
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" \
+            "dist/fu-${{ matrix.name }}${{ matrix.ext }}"
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: fu-${{ matrix.name }}
-          path: target/${{ matrix.target }}/release/${{ matrix.bin }}
+          path: dist/fu-${{ matrix.name }}${{ matrix.ext }}
           if-no-files-found: error
+
+  release:
+    name: Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v0.0.${{ github.run_number }}
+          name: v0.0.${{ github.run_number }}
+          files: artifacts/**/*
+          fail_on_unmatched_files: true
