@@ -106,17 +106,49 @@ pub struct PlayerState {
 }
 
 /// One tick of this client's local simulation: a snapshot of every locally-controlled
-/// player's physics, paired with whichever `GameEvent` (if any) was sent to the server
-/// that tick. Tagged with the `Ticker` value it was recorded at.
+/// player's physics, paired with a `GameEvent` (if any) for that tick. The event may be
+/// one this client *sent* to the server (recorded by `move_player`/`start_swing`/ 
+/// `detect_strikes`) or one it *received* from another client (recorded by
+/// `drain_server_events`). Tagged with the `Ticker` value it was recorded at.
 pub struct SentGameEvent {
     pub tick: u64,
     pub event: (Vec<PlayerState>, Option<GameEvent>),
 }
 
 /// One entry per tick of local simulation recorded so far. Present only while
-/// `AppState::Playing` (inserted alongside `Ticker`).
+/// `AppState::Playing` (inserted alongside `Ticker`). Kept in non-decreasing `tick` order.
 #[derive(Resource, Default)]
 pub struct SentGameEvents(pub Vec<SentGameEvent>);
+
+impl SentGameEvents {
+    /// Inserts a received (remote) `game_event` into the ledger keeping it ordered by `tick`.
+    /// The snapshot is copied from the existing entry already recorded at that tick (the local
+    /// state we simulated for it), or empty if none exists yet. The list is maintained in
+    /// non-decreasing `tick` order, so a binary search finds the insertion point.
+    pub fn insert_received(&mut self, events: Vec<(u64, GameEvent)>) -> Option<u64> {
+        let mut lowest_tick = None;
+        for ticked_event in events {
+            if let Some(current_lowest_tick) = lowest_tick {
+                if current_lowest_tick < ticked_event.0 {
+                    lowest_tick = Some(ticked_event.0);
+                }
+            } else {
+                lowest_tick = Some(ticked_event.0);
+            }
+            let snapshot = self
+                .0
+                .iter()
+                .find(|e| e.tick == ticked_event.0)
+                .map(|e| e.event.0.clone())
+                .unwrap_or_default();
+            // Insert after any entries already at this tick, so the local same-tick snapshot
+            // precedes the remote event.
+            let idx = self.0.partition_point(|e| e.tick <= ticked_event.0);
+            self.0.insert(idx, SentGameEvent { tick: ticked_event.0, event: (snapshot, Some(ticked_event.1)) });
+        }
+        lowest_tick
+    }
+}
 
 /// Snapshots the physics of every player in `local_ids` for the `SentGameEvents` ledger.
 fn snapshot_local_players<'a>(
@@ -336,6 +368,7 @@ pub fn drain_server_events(
     overlay: Query<Entity, With<CountdownOverlay>>,
     mut next_state: ResMut<NextState<AppState>>,
     mut ticker: ResMut<Ticker>,
+    mut sent_events: ResMut<SentGameEvents>,
 ) {
     ticker.0 += 1;
 
@@ -346,6 +379,8 @@ pub fn drain_server_events(
         *server_events = vec![];
         events
     };
+    let game_events = events.iter().filter_map(|event| { if let ServerEvent::GameEvent{tick: tick, game_event: game_event} = event { Some((*tick, game_event.clone())) } else { None } }).collect();
+    let lowest_received_tick = sent_events.insert_received(game_events);
     for event in events {
         if let ServerEvent::GameEvent { tick, game_event: game_event } = event {
             match game_event {
