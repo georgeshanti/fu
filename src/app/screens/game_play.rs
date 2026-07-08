@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 
 use avian3d::prelude::*;
-use bevy::{ecs::change_detection::Tick, prelude::*};
+use bevy::{ecs::{change_detection::Tick, system::SystemState}, prelude::*};
 
 use crate::{
     app::{GameClientWrapper, screens::{app_state::AppState, lobby::PendingSpawns}}, server::{ClientEvent, Controller, GameEffect, OrderedF32, PlayerAction, ServerEvent},
@@ -394,16 +394,28 @@ pub fn wait_for_start(
 }
 
 pub fn drain_server_events(
-    mut commands: Commands,
-    client: Res<GameClientWrapper>,
-    mut query: Query<(Entity, &Player, &mut LinearVelocity, &mut ConstantLinearAcceleration, &mut Rotation, &mut Transform), Without<Dead>>,
-    swing_targets: Query<(&Player, &Children), Without<Dead>>,
-    lobjects: Query<Entity, (With<Boomerang>, Without<Swinging>)>,
-    overlay: Query<Entity, With<CountdownOverlay>>,
-    mut next_state: ResMut<NextState<AppState>>,
-    mut ticker: ResMut<Ticker>,
-    mut sent_events: ResMut<LocalGameEvents>,
+    world: &mut World,
+    // The queries and resources this system used to take as individual params are
+    // now pulled out of the `World` via a cached `SystemState`. Keeping it in a
+    // `Local` preserves the query/change-detection state across frames instead of
+    // rebuilding it every call.
+    mut params: Local<SystemState<(
+        Commands,
+        Res<GameClientWrapper>,
+        Query<(Entity, &Player, &mut LinearVelocity, &mut ConstantLinearAcceleration, &mut Rotation, &mut Transform), Without<Dead>>,
+        Query<(&Player, &Children), Without<Dead>>,
+        Query<Entity, (With<Boomerang>, Without<Swinging>)>,
+        ResMut<Ticker>,
+        ResMut<LocalGameEvents>,
+    )>>,
 ) {
+    // Compute the query/resource values from the world for this frame. Held inside
+    // a block so every borrow of `world` (including the `RwLockReadGuard` taken from
+    // `client` below) is released before we `apply` the deferred commands.
+    {
+    let (mut commands, client, mut query, swing_targets, lobjects, mut ticker, mut sent_events) =
+        params.get_mut(world);
+
     ticker.0 += 1;
     record_tick_state(&ticker, &mut sent_events, query.transmute_lens::<(&Player, &Transform, &LinearVelocity, &Rotation, &ConstantLinearAcceleration)>().query());
     let client = client.client.read().unwrap();
@@ -413,13 +425,21 @@ pub fn drain_server_events(
         *server_events = vec![];
         events
     };
-    let game_events = events.iter().filter_map(|event| { if let ServerEvent::PlayerAction{tick: tick, game_event: game_event} = event { Some((*tick, game_event.clone())) } else { None } }).collect();
-    let lowest_received_tick = sent_events.insert_received_player_actions(game_events);
-    if let Some(lowest_received_tick) = lowest_received_tick {
-        for event in events {
-            match event {
-                ServerEvent::PlayerAction { tick, game_event } => {
-                    match game_event {
+    let mut game_events: Vec<(u64, PlayerAction)> = events.iter().filter_map(|event| { if let ServerEvent::PlayerAction{tick: tick, game_event: game_event} = event { Some((*tick, game_event.clone())) } else { None } }).collect();
+    game_events.sort_by(|a, b| {a.0.cmp(&b.0)});
+    if !game_events.is_empty() {
+        let mut current_tick = game_events.first().unwrap().0;
+        let final_tick = std::cmp::max(game_events.last().unwrap().0, ticker.0);
+        while current_tick < final_tick {
+            // TODO: handle scenario where current tick is in future. remove the .unwrap()
+            let tick_record = sent_events.game_events.get_mut(current_tick as usize).unwrap();
+            let mut drive_world = true;
+            if !game_events.is_empty() {
+                let first = game_events.first().unwrap();
+                if first.0==current_tick {
+                    drive_world = false;
+                    tick_record.player_actions.insert(first.1.clone());
+                    match first.1 {
                         PlayerAction::Movement { player_id, x, y } => {
                             for (_entity, player, mut vel, mut accel, mut rotation, _) in &mut query {
                                 if player.player_id == player_id {
@@ -446,24 +466,19 @@ pub fn drain_server_events(
                             }
                         }
                     }
-                },
-                ServerEvent::GameEffect { tick, game_event } => {
-                    match game_event {
-                        GameEffect::StrikePlayer { struck_id, .. } => {
-                            // Mark the struck player dead; `animate_death` shrinks it and
-                            // `apply_dead_collision_layers` relayers it to touch only the platform.
-                            for (entity, player, ..) in &query {
-                                if player.player_id == struck_id {
-                                    commands.entity(entity).insert(Dead { elapsed: 0.0 });
-                                }
-                            }
-                        }
-                    }
-                },
-                _ => {},
+                }
+            }
+            if drive_world {
+
             }
         }
     }
+    }
+
+    // Flush the entity insertions deferred through `commands`; a normal system does
+    // this automatically, but an exclusive `&mut World` system must apply its own
+    // `SystemState`.
+    params.apply(world);
 }
 
 
