@@ -7,6 +7,45 @@ use crate::connection::server::create_server;
 pub static GAME_SERVER: Mutex<Option<GameServer>> = Mutex::new(None);
 pub static CLIENT_EVENT_SENDER: Mutex<Option<Sender<ClientEvent>>> = Mutex::new(None);
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct OrderedF32(pub f32);
+
+impl Eq for OrderedF32 {}
+
+impl PartialEq for OrderedF32 {
+    fn eq(&self, other: &Self) -> bool {
+        match (self.0.is_nan(), other.0.is_nan()) {
+            (true, true) => true,
+            (true, false) => false,
+            (false, true) => false,
+            (false, false) => self.0 == other.0,
+        }
+    }
+}
+
+impl PartialOrd for OrderedF32 {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for OrderedF32 {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        match (self.0.is_nan(), other.0.is_nan()) {
+            (true, true) => std::cmp::Ordering::Equal,
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            (false, false) => if self.0 == other.0 {
+                std::cmp::Ordering::Equal
+            } else if self.0 < other.0 {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Greater
+            },
+        }
+    }
+}
+
 /// Creates a new game server and stores it in the global `GAME_SERVER`.
 /// Returns the sender clients use to push events to this server.
 pub fn create_game_server() {
@@ -79,7 +118,8 @@ pub enum ServerEvent {
     SpawnPlayers { spawns: Vec<(Player, Vec3)> },
     /// Players have been spawned by all clients and now the round may start.
     StartRound,
-    GameEvent {tick: u64, game_event: GameEvent},
+    PlayerAction {tick: u64, game_event: PlayerAction},
+    GameEffect {tick: u64, game_event: GameEffect},
 }
 
 /// Events originating from a client, sent to the server.
@@ -93,14 +133,19 @@ pub enum ClientEvent {
     StartGame,
     /// Sent once a client has finished spawning the platform and its players.
     PlayersSpawned { client_id: u8 },
-    GameEvent {tick: u64, game_event: GameEvent}
+    PlayerAction {tick: u64, game_event: PlayerAction},
+    GameEffect {tick: u64, game_event: GameEffect},
 }
 
-#[derive(Event, Debug, Clone, Serialize, Deserialize)]
-pub enum GameEvent{
-    Movement { player_id: u8, x: f32, y: f32 },
+#[derive(Event, Debug, Clone, Serialize, Deserialize, PartialEq, PartialOrd, Eq, Ord)]
+pub enum PlayerAction {
+    Movement { player_id: u8, x: OrderedF32, y: OrderedF32 },
     /// A player pressed their swing input; starts a boomerang swing for that player.
     Swing { player_id: u8 },
+}
+
+#[derive(Event, Debug, Clone, Serialize, Deserialize, PartialEq, PartialOrd, Eq, Ord)]
+pub enum GameEffect {
     /// A striker's boomerang hit another player; carries both player ids.
     StrikePlayer { striker_id: u8, struck_id: u8 },
 }
@@ -222,19 +267,23 @@ impl GameServer {
                             pending.clear();
                         }
                     }
-                    ClientEvent::GameEvent { tick, game_event } => {
+                    ClientEvent::PlayerAction { tick, game_event } => {
                         match game_event {
-                            GameEvent::Movement{player_id, x, y} => {
+                            PlayerAction::Movement{player_id, x, y} => {
                                 for client in clients.1.values() {
-                                    let _ = client.send(ServerEvent::GameEvent { tick, game_event: GameEvent::Movement { player_id, x, y }});
+                                    let _ = client.send(ServerEvent::PlayerAction { tick, game_event: PlayerAction::Movement { player_id, x, y }});
                                 }
                             }
-                            GameEvent::Swing { player_id } => {
+                            PlayerAction::Swing { player_id } => {
                                 for client in clients.1.values() {
-                                    let _ = client.send(ServerEvent::GameEvent { tick, game_event: GameEvent::Swing { player_id }});
+                                    let _ = client.send(ServerEvent::PlayerAction { tick, game_event: PlayerAction::Swing { player_id }});
                                 }
                             }
-                            GameEvent::StrikePlayer { struck_id, striker_id } => {
+                        }
+                    }
+                    ClientEvent::GameEffect { tick, game_event } => {
+                        match game_event {
+                            GameEffect::StrikePlayer { struck_id, striker_id } => {
                                 // Only relay on the alive->dead transition, so the many
                                 // collision events a single swing produces collapse to one
                                 // PlayerStriked broadcast.
@@ -247,7 +296,7 @@ impl GameServer {
                                 };
                                 if relay {
                                     for client in clients.1.values() {
-                                        let _ = client.send(ServerEvent::GameEvent {tick, game_event: GameEvent::StrikePlayer { struck_id, striker_id }});
+                                        let _ = client.send(ServerEvent::GameEffect {tick, game_event: GameEffect::StrikePlayer { struck_id, striker_id }});
                                     }
                                 }
                             }
