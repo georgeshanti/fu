@@ -91,79 +91,128 @@ pub struct Countdown {
     remaining: f32,
 }
 
-/// Counts `drain_server_events` invocations. Present only while `AppState::Playing`;
-/// stamped onto outgoing `ClientEvent::GameEvent`s in place of the old hardcoded `tick: 0`.
+/// Counts simulated fixed-update ticks (`drain_server_events` invocations). Present only
+/// while `AppState::Playing`. Events produced by the Update-schedule input systems are
+/// stamped `Ticker + 1` — the next tick to be simulated — since the current tick's physics
+/// step has already run by the time they fire.
 #[derive(Resource, Default)]
 pub struct Ticker(pub u64);
 
-/// A snapshot of one locally-controlled player's physics at a given tick.
+/// How many ticks of simulation history the ledger keeps for rollback: ~5 s at Bevy's
+/// default 64 Hz fixed timestep. An event older than the window is applied at the oldest
+/// retained tick instead of its true tick (better late than never).
+const ROLLBACK_WINDOW_TICKS: usize = 320;
+
+/// A snapshot of one player's physics at the start of a tick. Uses Avian's `Position`/
+/// `Rotation` (the physics source of truth), not `Transform` — the Transform syncs run
+/// outside `PhysicsSchedule`, so during replay only the Avian components are current.
+/// `acceleration` mirrors `ConstantLinearAcceleration`: it persists between `Movement`
+/// events, so a rolled-back player whose last `Movement` predates the rollback point
+/// would otherwise replay with the wrong accel.
 #[derive(Clone)]
 pub struct PlayerState {
     pub player_id: u8,
     pub position: Vec3,
     pub velocity: Vec3,
     pub rotation: Quat,
+    pub acceleration: Vec3,
 }
 
-/// One tick of this client's local simulation: a snapshot of every locally-controlled
-/// player's physics, paired with a `GameEvent` (if any) for that tick. The event may be
-/// one this client *sent* to the server (recorded by `move_player`/`start_swing`/ 
-/// `detect_strikes`) or one it *received* from another client (recorded by
-/// `drain_server_events`). Tagged with the `Ticker` value it was recorded at.
-pub struct SentGameEvent {
-    pub tick: u64,
-    pub event: (Vec<PlayerState>, Option<GameEvent>),
+/// One simulated tick: the state of every player at the *start* of the tick (before the
+/// tick's events are applied and before its physics step), plus the events to apply at
+/// this tick. Replaying tick k = "apply `events`, run one physics step", which produces
+/// the snapshot for tick k+1.
+pub struct TickRecord {
+    pub snapshot: Vec<PlayerState>,
+    pub events: Vec<GameEvent>,
 }
 
-/// One entry per tick of local simulation recorded so far. Present only while
-/// `AppState::Playing` (inserted alongside `Ticker`). Kept in non-decreasing `tick` order.
+/// Dense per-tick simulation history: `records[i]` is tick `base_tick + i`. Present only
+/// while `AppState::Playing` (inserted alongside `Ticker`). Holds both events this client
+/// sent and events received from the server; identical events at the same tick are stored
+/// once, which is how a client's own echoed-back events are recognized and ignored.
 #[derive(Resource, Default)]
-pub struct SentGameEvents(pub Vec<SentGameEvent>);
-
-impl SentGameEvents {
-    /// Inserts a received (remote) `game_event` into the ledger keeping it ordered by `tick`.
-    /// The snapshot is copied from the existing entry already recorded at that tick (the local
-    /// state we simulated for it), or empty if none exists yet. The list is maintained in
-    /// non-decreasing `tick` order, so a binary search finds the insertion point.
-    pub fn insert_received(&mut self, events: Vec<(u64, GameEvent)>) -> Option<u64> {
-        let mut lowest_tick = None;
-        for ticked_event in events {
-            if let Some(current_lowest_tick) = lowest_tick {
-                if current_lowest_tick < ticked_event.0 {
-                    lowest_tick = Some(ticked_event.0);
-                }
-            } else {
-                lowest_tick = Some(ticked_event.0);
-            }
-            let snapshot = self
-                .0
-                .iter()
-                .find(|e| e.tick == ticked_event.0)
-                .map(|e| e.event.0.clone())
-                .unwrap_or_default();
-            // Insert after any entries already at this tick, so the local same-tick snapshot
-            // precedes the remote event.
-            let idx = self.0.partition_point(|e| e.tick <= ticked_event.0);
-            self.0.insert(idx, SentGameEvent { tick: ticked_event.0, event: (snapshot, Some(ticked_event.1)) });
-        }
-        lowest_tick
-    }
+pub struct TickLedger {
+    pub base_tick: u64,
+    pub records: Vec<TickRecord>,
+    /// Events for ticks the local simulation hasn't reached yet (client tickers are not
+    /// synchronized, so a received tick can be in the local future; local input is also
+    /// recorded one tick ahead). Moved into `records` by `begin_tick` when due.
+    pub deferred: Vec<(u64, GameEvent)>,
 }
 
-/// Snapshots the physics of every player in `local_ids` for the `SentGameEvents` ledger.
-fn snapshot_local_players<'a>(
-    local_ids: &[u8],
-    players: impl Iterator<Item = (&'a Player, &'a Transform, &'a LinearVelocity, &'a Rotation)>,
-) -> Vec<PlayerState> {
-    players
-        .filter(|(player, ..)| local_ids.contains(&player.player_id))
-        .map(|(player, transform, velocity, rotation)| PlayerState {
-            player_id: player.player_id,
-            position: transform.translation,
-            velocity: velocity.0,
-            rotation: rotation.0,
-        })
-        .collect()
+impl TickLedger {
+    /// Tick of the newest record. Only meaningful when `records` is non-empty.
+    fn last_tick(&self) -> u64 {
+        self.base_tick + self.records.len() as u64 - 1
+    }
+
+    /// Opens the record for `tick` with the given start-of-tick snapshot, pulling in any
+    /// deferred events that are now due. Called exactly once per tick, with consecutive
+    /// tick values, so the records stay dense.
+    pub fn begin_tick(&mut self, tick: u64, snapshot: Vec<PlayerState>) {
+        if self.records.is_empty() {
+            self.base_tick = tick;
+        }
+        let mut events = Vec::new();
+        self.deferred.retain(|(t, event)| {
+            if *t <= tick {
+                events.push(event.clone());
+                false
+            } else {
+                true
+            }
+        });
+        self.records.push(TickRecord { snapshot, events });
+    }
+
+    /// Records `event` at `tick`: into the tick's record (clamped to the retained window),
+    /// or into `deferred` if the tick hasn't been simulated yet. Returns the tick it was
+    /// stored at, or `None` if an identical event is already recorded there — the dedupe
+    /// that keeps this client's own events, echoed back by the server, from re-applying.
+    pub fn push_event(&mut self, tick: u64, event: GameEvent) -> Option<u64> {
+        if self.records.is_empty() || tick > self.last_tick() {
+            if self.deferred.iter().any(|(t, e)| *t == tick && *e == event) {
+                return None;
+            }
+            self.deferred.push((tick, event));
+            return Some(tick);
+        }
+        let tick = tick.max(self.base_tick);
+        let record = &mut self.records[(tick - self.base_tick) as usize];
+        if record.events.contains(&event) {
+            return None;
+        }
+        record.events.push(event);
+        Some(tick)
+    }
+
+    /// Inserts events received from the server. Returns the lowest tick that gained a
+    /// genuinely new event *in the local past* (strictly before `current_tick`) — the
+    /// tick to roll back to — or `None` if nothing new landed in the past.
+    pub fn insert_received(&mut self, current_tick: u64, events: Vec<(u64, GameEvent)>) -> Option<u64> {
+        let mut lowest_new_past_tick = None;
+        for (tick, event) in events {
+            let Some(stored_tick) = self.push_event(tick, event) else {
+                continue;
+            };
+            if stored_tick < current_tick
+                && lowest_new_past_tick.map_or(true, |lowest| stored_tick < lowest)
+            {
+                lowest_new_past_tick = Some(stored_tick);
+            }
+        }
+        lowest_new_past_tick
+    }
+
+    /// Drops records older than `ROLLBACK_WINDOW_TICKS` so the ledger stays bounded.
+    pub fn prune(&mut self) {
+        let excess = self.records.len().saturating_sub(ROLLBACK_WINDOW_TICKS);
+        if excess > 0 {
+            self.records.drain(..excess);
+            self.base_tick += excess as u64;
+        }
+    }
 }
 
 /// Root node of the countdown overlay (despawned when the countdown ends).
@@ -353,75 +402,193 @@ pub fn wait_for_start(
             }
             commands.remove_resource::<Countdown>();
             commands.insert_resource(Ticker(0));
-            commands.insert_resource(SentGameEvents::default());
+            commands.insert_resource(TickLedger::default());
             next_state.set(AppState::Playing);
         }
     }
 }
 
-pub fn drain_server_events(
-    mut commands: Commands,
-    client: Res<GameClientWrapper>,
-    mut query: Query<(Entity, &Player, &mut LinearVelocity, &mut ConstantLinearAcceleration, &mut Rotation), Without<Dead>>,
-    swing_targets: Query<(&Player, &Children), Without<Dead>>,
-    lobjects: Query<Entity, (With<Boomerang>, Without<Swinging>)>,
-    overlay: Query<Entity, With<CountdownOverlay>>,
-    mut next_state: ResMut<NextState<AppState>>,
-    mut ticker: ResMut<Ticker>,
-    mut sent_events: ResMut<SentGameEvents>,
-) {
-    ticker.0 += 1;
+/// Snapshots every player's physics state from Avian's `Position`/`Rotation` (current
+/// even mid-replay, unlike `Transform` — the Transform syncs run outside `PhysicsSchedule`).
+fn snapshot_players(world: &mut World) -> Vec<PlayerState> {
+    let mut query = world.query::<(&Player, &Position, &Rotation, &LinearVelocity, &ConstantLinearAcceleration)>();
+    query
+        .iter(world)
+        .map(|(player, position, rotation, velocity, accel)| PlayerState {
+            player_id: player.player_id,
+            position: position.0,
+            velocity: velocity.0,
+            rotation: rotation.0,
+            acceleration: accel.0,
+        })
+        .collect()
+}
 
-    let client = client.client.read().unwrap();
-    let events = {
-        let mut server_events = client.received_events.lock().unwrap();
-        let events = server_events.clone();
-        *server_events = vec![];
-        events
-    };
-    let game_events = events.iter().filter_map(|event| { if let ServerEvent::GameEvent{tick: tick, game_event: game_event} = event { Some((*tick, game_event.clone())) } else { None } }).collect();
-    let lowest_received_tick = sent_events.insert_received(game_events);
-    for event in events {
-        if let ServerEvent::GameEvent { tick, game_event: game_event } = event {
-            match game_event {
-                GameEvent::Movement { player_id, x, y } => {
-                    for (_entity, player, mut vel, mut accel, mut rotation) in &mut query {
-                        if player.player_id == player_id {
-                            vel.x = x;
-                            vel.z = y;
-                            *accel = ConstantLinearAcceleration(Vec3::new(x, 0.0, y).normalize_or_zero() * PLAYER_ACCEL);
-                            // Point the player (and its anchored L) toward the movement
-                            // direction. Forward is -Z, so yaw = atan2(-x, -z). Leave the
-                            // facing unchanged when stationary.
-                            if Vec3::new(x, 0.0, y).length_squared() > 1e-6 {
-                                *rotation = Quat::from_rotation_y(f32::atan2(-x, -y)).into();
-                            }
-                        }
-                    }
-                },
-                GameEvent::Swing { player_id } => {
-                    for (player, children) in &swing_targets {
-                        if player.player_id != player_id { continue; }
-                        for child in children.iter() {
-                            if let Ok(boomerang) = lobjects.get(child) {
-                                commands.entity(boomerang).insert(Swinging { elapsed: 0.0 });
-                            }
-                        }
+/// Restores every snapshotted player's physics state. Writes Avian's `Position`/`Rotation`
+/// directly — the physics source of truth — since the Transform→Position sync won't run
+/// before the manual replay steps. Players missing from the snapshot are left untouched.
+fn restore_players(world: &mut World, snapshot: &[PlayerState]) {
+    let mut query = world.query::<(&Player, &mut Position, &mut Rotation, &mut LinearVelocity, &mut ConstantLinearAcceleration)>();
+    for (player, mut position, mut rotation, mut velocity, mut accel) in query.iter_mut(world) {
+        if let Some(state) = snapshot.iter().find(|s| s.player_id == player.player_id) {
+            position.0 = state.position;
+            *rotation = Rotation(state.rotation);
+            velocity.0 = state.velocity;
+            accel.0 = state.acceleration;
+        }
+    }
+}
+
+/// Copies each player's replayed `Position`/`Rotation` back onto its `Transform`. Avian's
+/// `Writeback` sync only runs for the normally-scheduled step, so after manual replay
+/// steps the Transforms are stale; left that way, the next `Prepare` (Transform→Position)
+/// sync would clobber the corrected physics state with the pre-rollback one.
+fn mirror_physics_to_transforms(world: &mut World) {
+    let mut query = world.query_filtered::<(&Position, &Rotation, &mut Transform), With<Player>>();
+    for (position, rotation, mut transform) in query.iter_mut(world) {
+        transform.translation = position.0;
+        transform.rotation = rotation.0;
+    }
+}
+
+/// Applies one `GameEvent` to the local simulation. The single application path for both
+/// the live tick and rollback replay, so they can't diverge.
+fn apply_game_event(world: &mut World, game_event: &GameEvent) {
+    match game_event {
+        GameEvent::Movement { player_id, x, y } => {
+            let mut query = world.query_filtered::<(&Player, &mut LinearVelocity, &mut ConstantLinearAcceleration, &mut Rotation), Without<Dead>>();
+            for (player, mut vel, mut accel, mut rotation) in query.iter_mut(world) {
+                if player.player_id == *player_id {
+                    vel.x = *x;
+                    vel.z = *y;
+                    *accel = ConstantLinearAcceleration(Vec3::new(*x, 0.0, *y).normalize_or_zero() * PLAYER_ACCEL);
+                    // Point the player (and its anchored L) toward the movement
+                    // direction. Forward is -Z, so yaw = atan2(-x, -z). Leave the
+                    // facing unchanged when stationary.
+                    if Vec3::new(*x, 0.0, *y).length_squared() > 1e-6 {
+                        *rotation = Quat::from_rotation_y(f32::atan2(-*x, -*y)).into();
                     }
                 }
-                GameEvent::StrikePlayer { struck_id, .. } => {
-                    // Mark the struck player dead; `animate_death` shrinks it and
-                    // `apply_dead_collision_layers` relayers it to touch only the platform.
-                    for (entity, player, ..) in &query {
-                        if player.player_id == struck_id {
-                            commands.entity(entity).insert(Dead { elapsed: 0.0 });
-                        }
-                    }
+            }
+        }
+        GameEvent::Swing { player_id } => {
+            let mut boomerangs = Vec::new();
+            let mut query = world.query_filtered::<(&Player, &Children), Without<Dead>>();
+            for (player, children) in query.iter(world) {
+                if player.player_id != *player_id {
+                    continue;
                 }
-                _ => {}
+                boomerangs.extend(children.iter());
+            }
+            for child in boomerangs {
+                let entity = world.entity(child);
+                // Mirror the live gating: only a resting boomerang starts a swing, so a
+                // replayed Swing doesn't restart one already in flight.
+                if entity.contains::<Boomerang>() && !entity.contains::<Swinging>() {
+                    world.entity_mut(child).insert(Swinging { elapsed: 0.0 });
+                }
+            }
+        }
+        GameEvent::StrikePlayer { struck_id, .. } => {
+            // Mark the struck player dead; `animate_death` shrinks it and
+            // `apply_dead_collision_layers` relayers it to touch only the platform.
+            let mut struck = Vec::new();
+            let mut query = world.query_filtered::<(Entity, &Player), Without<Dead>>();
+            for (entity, player) in query.iter(world) {
+                if player.player_id == *struck_id {
+                    struck.push(entity);
+                }
+            }
+            for entity in struck {
+                world.entity_mut(entity).insert(Dead { elapsed: 0.0 });
             }
         }
     }
+}
+
+/// The per-tick heart of the client simulation, run in `FixedUpdate` just before Avian
+/// steps in `FixedPostUpdate`. Advances the `Ticker`, snapshots the start-of-tick state
+/// into the `TickLedger`, and drains the network buffer. A received event whose tick is
+/// already in the local past triggers a rollback: restore that tick's snapshot, then
+/// re-simulate up to the present — re-applying each tick's ledger events and manually
+/// running one `PhysicsSchedule` step per tick, overwriting the now-stale snapshots.
+/// Finally the current tick's events (received for now, deferred-until-now, or recorded
+/// by last frame's input systems) are applied, ahead of this tick's normal physics step.
+///
+/// Exclusive (`&mut World`) because replay must run `PhysicsSchedule` mid-system.
+pub fn drain_server_events(world: &mut World) {
+    // Advance the tick and open its ledger record with the start-of-tick snapshot.
+    let tick = {
+        let mut ticker = world.resource_mut::<Ticker>();
+        ticker.0 += 1;
+        ticker.0
+    };
+    let snapshot = snapshot_players(world);
+    world.resource_mut::<TickLedger>().begin_tick(tick, snapshot);
+
+    // Drain the network buffer and ledger the game events. Other `ServerEvent`s are not
+    // handled during play, as before.
+    let events = {
+        let client = world.resource::<GameClientWrapper>().client.clone();
+        let client = client.read().unwrap();
+        let mut server_events = client.received_events.lock().unwrap();
+        std::mem::take(&mut *server_events)
+    };
+    let game_events = events
+        .into_iter()
+        .filter_map(|event| {
+            if let ServerEvent::GameEvent { tick, game_event } = event {
+                Some((tick, game_event))
+            } else {
+                None
+            }
+        })
+        .collect();
+    let rollback_tick = world
+        .resource_mut::<TickLedger>()
+        .insert_received(tick, game_events);
+
+    // Rollback + replay when a genuinely new event landed in the local past.
+    if let Some(rollback_tick) = rollback_tick {
+        let restore_snapshot = {
+            let ledger = world.resource::<TickLedger>();
+            ledger.records[(rollback_tick - ledger.base_tick) as usize].snapshot.clone()
+        };
+        restore_players(world, &restore_snapshot);
+
+        let timestep = world.resource::<Time<Fixed>>().timestep();
+        for replay_tick in rollback_tick..tick {
+            let replay_events = {
+                let ledger = world.resource::<TickLedger>();
+                ledger.records[(replay_tick - ledger.base_tick) as usize].events.clone()
+            };
+            for event in &replay_events {
+                apply_game_event(world, event);
+            }
+            // One manual physics step: `PhysicsSchedule` consumes `Time<Physics>`'s delta,
+            // which must be advanced by hand when the schedule is run outside its driver.
+            // (Replayed steps re-emit CollisionStart messages, so `detect_strikes` may
+            // re-report strikes — benign, the server dedupes on the alive→dead transition.)
+            world.resource_mut::<Time<Physics>>().advance_by(timestep);
+            world.run_schedule(PhysicsSchedule);
+            let snapshot = snapshot_players(world);
+            let mut ledger = world.resource_mut::<TickLedger>();
+            let base_tick = ledger.base_tick;
+            ledger.records[(replay_tick + 1 - base_tick) as usize].snapshot = snapshot;
+        }
+        mirror_physics_to_transforms(world);
+    }
+
+    // Apply the current tick's events before this tick's physics step.
+    let current_events = {
+        let ledger = world.resource::<TickLedger>();
+        ledger.records[(tick - ledger.base_tick) as usize].events.clone()
+    };
+    for event in &current_events {
+        apply_game_event(world, event);
+    }
+
+    world.resource_mut::<TickLedger>().prune();
 }
 
 
@@ -438,8 +605,8 @@ pub fn move_player(
     client: Res<GameClientWrapper>,
     time: Res<Time>,
     ticker: Res<Ticker>,
-    mut sent_events: ResMut<SentGameEvents>,
-    mut query: Query<(&mut Player, &Transform, &LinearVelocity, &Rotation), Without<Dead>>,
+    mut ledger: ResMut<TickLedger>,
+    mut query: Query<&mut Player, Without<Dead>>,
 ) {
 
     // Snapshot this client's local roster (player_id -> controller), releasing the
@@ -449,8 +616,6 @@ pub fn move_player(
         let players = client.players.read().unwrap();
         players.iter().map(|p| (p.id, p.controller)).collect()
     };
-    let local_ids: Vec<u8> = roster.iter().map(|(id, _)| *id).collect();
-    let snapshot = snapshot_local_players(&local_ids, query.iter());
 
     // Collect the velocity each active controller wants for its assigned player.
     let mut moves: Vec<(u8, Vec3)> = Vec::new();
@@ -490,7 +655,7 @@ pub fn move_player(
     // Apply: route each velocity to its player entity, sending only when the
     // direction changed or the keep-alive interval has elapsed since the last event.
     for (player_id, velocity) in moves {
-        for (mut player, ..) in &mut query {
+        for mut player in &mut query {
             if player.player_id == player_id {
                 let direction_changed = player.direction != velocity;
                 // let interval_elapsed = player.last_direction_event_timestamp.elapsed().unwrap().as_millis() >= DIRECTION_EVENT_INTERVAL;
@@ -499,9 +664,13 @@ pub fn move_player(
                     player.direction = velocity;
                     player.last_direction_event_timestamp = std::time::SystemTime::now();
                     if let Some(sender) = &client.client.read().unwrap().sender {
+                        // Recorded (and sent) for the *next* tick: this tick's physics
+                        // already ran, so `drain_server_events` applies it at the top of
+                        // tick+1 — the same path a replay takes, and the server's echo
+                        // of it dedupes against this ledger entry instead of rolling back.
                         let game_event = GameEvent::Movement { player_id, x: velocity.x, y: velocity.z };
-                        sent_events.0.push(SentGameEvent { tick: ticker.0, event: (snapshot.clone(), Some(game_event.clone())) });
-                        sender.send(ClientEvent::GameEvent { tick: ticker.0, game_event }).ok();
+                        ledger.push_event(ticker.0 + 1, game_event.clone());
+                        sender.send(ClientEvent::GameEvent { tick: ticker.0 + 1, game_event }).ok();
                     }
                 }
             }
@@ -518,18 +687,15 @@ pub fn start_swing(
     gamepads: Query<(Entity, &Gamepad)>,
     client: Res<GameClientWrapper>,
     ticker: Res<Ticker>,
-    mut sent_events: ResMut<SentGameEvents>,
+    mut ledger: ResMut<TickLedger>,
     players: Query<(&Player, &Children), Without<SwingCooldown>>,
     lobjects: Query<(), (With<Boomerang>, Without<Swinging>)>,
-    state_query: Query<(&Player, &Transform, &LinearVelocity, &Rotation)>,
 ) {
     let roster: Vec<(u8, Controller)> = {
         let client = client.client.read().unwrap();
         let players = client.players.read().unwrap();
         players.iter().map(|p| (p.id, p.controller)).collect()
     };
-    let local_ids: Vec<u8> = roster.iter().map(|(id, _)| *id).collect();
-    let snapshot = snapshot_local_players(&local_ids, state_query.iter());
     if keyboard.just_pressed(KeyCode::KeyZ) {
         if let Some((id, _)) = roster.iter().find(|(_, c)| *c == Controller::Keyboard) {
             for (player, children) in &players {
@@ -537,10 +703,11 @@ pub fn start_swing(
                 for child in children.iter() {
                     if lobjects.get(child).is_ok() {
                         if let Some(sender) = &client.client.read().unwrap().sender {
+                            // Recorded and sent for the next tick — see `move_player`.
                             let game_event = GameEvent::Swing { player_id: *id };
-                            sent_events.0.push(SentGameEvent { tick: ticker.0, event: (snapshot.clone(), Some(game_event.clone())) });
+                            ledger.push_event(ticker.0 + 1, game_event.clone());
                             sender.send(ClientEvent::GameEvent {
-                                tick: ticker.0,
+                                tick: ticker.0 + 1,
                                 game_event,
                             }).ok();
                         }
@@ -558,10 +725,11 @@ pub fn start_swing(
             for child in children.iter() {
                 if lobjects.get(child).is_ok() {
                     if let Some(sender) = &client.client.read().unwrap().sender {
+                        // Recorded and sent for the next tick — see `move_player`.
                         let game_event = GameEvent::Swing { player_id: *id };
-                        sent_events.0.push(SentGameEvent { tick: ticker.0, event: (snapshot.clone(), Some(game_event.clone())) });
+                        ledger.push_event(ticker.0 + 1, game_event.clone());
                         sender.send(ClientEvent::GameEvent {
-                            tick: ticker.0,
+                            tick: ticker.0 + 1,
                             game_event,
                         }).ok();
                     }
@@ -622,8 +790,7 @@ pub fn detect_strikes(
     blades: Query<&ChildOf, With<BoomerangBlade>>,
     swinging: Query<(), With<Swinging>>,
     ticker: Res<Ticker>,
-    mut sent_events: ResMut<SentGameEvents>,
-    state_query: Query<(&Player, &Transform, &LinearVelocity, &Rotation)>,
+    mut ledger: ResMut<TickLedger>,
 ) {
     // Snapshot which player ids this client controls locally.
     let local_ids: Vec<u8> = {
@@ -631,7 +798,6 @@ pub fn detect_strikes(
         let players = client.players.read().unwrap();
         players.iter().map(|p| p.id).collect()
     };
-    let snapshot = snapshot_local_players(&local_ids, state_query.iter());
 
     for event in collisions.read() {
         // Exactly one collider must be a blade. Neither -> a body-to-body bump;
@@ -663,13 +829,14 @@ pub fn detect_strikes(
         }
 
         if let Some(sender) = &client.client.read().unwrap().sender {
+            // Recorded and sent for the next tick — see `move_player`.
             let game_event = GameEvent::StrikePlayer {
                 striker_id: striker.player_id,
                 struck_id: struck.player_id,
             };
-            sent_events.0.push(SentGameEvent { tick: ticker.0, event: (snapshot.clone(), Some(game_event.clone())) });
+            ledger.push_event(ticker.0 + 1, game_event.clone());
             sender
-                .send(ClientEvent::GameEvent { tick: ticker.0, game_event })
+                .send(ClientEvent::GameEvent { tick: ticker.0 + 1, game_event })
                 .ok();
         }
     }
@@ -707,26 +874,3 @@ pub fn animate_death(time: Res<Time>, mut query: Query<(&mut Transform, &mut Dea
     }
 }
 
-/// Records a `SentGameEvent` for the current tick if `move_player`/`start_swing`/
-/// `detect_strikes` didn't already log one (i.e. no `GameEvent` was sent this tick).
-/// Must run after those three systems so `sent_events`'s last tick reflects whether
-/// they fired this frame.
-pub fn record_tick_state(
-    client: Res<GameClientWrapper>,
-    ticker: Res<Ticker>,
-    mut sent_events: ResMut<SentGameEvents>,
-    state_query: Query<(&Player, &Transform, &LinearVelocity, &Rotation)>,
-) {
-    if sent_events.0.last().map(|e| e.tick) == Some(ticker.0) {
-        return;
-    }
-    let local_ids: Vec<u8> = {
-        let client = client.client.read().unwrap();
-        let players = client.players.read().unwrap();
-        players.iter().map(|p| p.id).collect()
-    };
-    sent_events.0.push(SentGameEvent {
-        tick: ticker.0,
-        event: (snapshot_local_players(&local_ids, state_query.iter()), None),
-    });
-}

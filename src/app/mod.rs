@@ -71,7 +71,6 @@ pub fn run() {
                 detect_strikes,
                 apply_dead_collision_layers,
                 animate_death,
-                record_tick_state.after(move_player).after(start_swing).after(detect_strikes),
             )
                 .run_if(in_state(AppState::Playing)),
         )

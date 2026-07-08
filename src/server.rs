@@ -96,7 +96,9 @@ pub enum ClientEvent {
     GameEvent {tick: u64, game_event: GameEvent}
 }
 
-#[derive(Event, Debug, Clone, Serialize, Deserialize)]
+// `PartialEq` (not `Eq` — f32 fields) lets the client's tick ledger detect its own
+// events when the server echoes them back, so they don't trigger a rollback.
+#[derive(Event, Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum GameEvent{
     Movement { player_id: u8, x: f32, y: f32 },
     /// A player pressed their swing input; starts a boomerang swing for that player.
