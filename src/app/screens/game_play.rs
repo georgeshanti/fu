@@ -409,28 +409,39 @@ pub fn drain_server_events(
         ResMut<LocalGameEvents>,
     )>>,
 ) {
-    // Compute the query/resource values from the world for this frame. Held inside
-    // a block so every borrow of `world` (including the `RwLockReadGuard` taken from
-    // `client` below) is released before we `apply` the deferred commands.
     {
-    let (mut commands, client, mut query, swing_targets, lobjects, mut ticker, mut sent_events) =
-        params.get_mut(world);
+        let (mut commands, client, mut query, swing_targets, lobjects, mut ticker, mut sent_events) =
+            params.get_mut(world);
 
-    ticker.0 += 1;
-    record_tick_state(&ticker, &mut sent_events, query.transmute_lens::<(&Player, &Transform, &LinearVelocity, &Rotation, &ConstantLinearAcceleration)>().query());
-    let client = client.client.read().unwrap();
-    let events = {
-        let mut server_events = client.received_events.lock().unwrap();
-        let events = server_events.clone();
-        *server_events = vec![];
-        events
+        ticker.0 += 1;
+        record_tick_state(&ticker, &mut sent_events, query.transmute_lens::<(&Player, &Transform, &LinearVelocity, &Rotation, &ConstantLinearAcceleration)>().query());
+    }
+    let mut game_events = {
+        let (mut commands, client, mut query, swing_targets, lobjects, mut ticker, mut sent_events) =
+            params.get_mut(world);
+        let client = client.client.read().unwrap();
+        let events = {
+            let mut server_events = client.received_events.lock().unwrap();
+            let events = server_events.clone();
+            *server_events = vec![];
+            events
+        };
+        let mut game_events: Vec<(u64, PlayerAction)> = events.iter().filter_map(|event| { if let ServerEvent::PlayerAction{tick: tick, game_event: game_event} = event { Some((*tick, game_event.clone())) } else { None } }).collect();
+        game_events.sort_by(|a, b| {a.0.cmp(&b.0)});
+        game_events
     };
-    let mut game_events: Vec<(u64, PlayerAction)> = events.iter().filter_map(|event| { if let ServerEvent::PlayerAction{tick: tick, game_event: game_event} = event { Some((*tick, game_event.clone())) } else { None } }).collect();
-    game_events.sort_by(|a, b| {a.0.cmp(&b.0)});
     if !game_events.is_empty() {
         let mut current_tick = game_events.first().unwrap().0;
-        let final_tick = std::cmp::max(game_events.last().unwrap().0, ticker.0);
+        let ticker = {
+            let (mut commands, client, mut query, swing_targets, lobjects, mut ticker, mut sent_events) =
+                params.get_mut(world);
+            ticker.0
+        };
+        let final_tick = std::cmp::max(game_events.last().unwrap().0, ticker);
         while current_tick < final_tick {
+            let (mut commands, client, mut query, swing_targets, lobjects, mut ticker, mut sent_events) =
+                params.get_mut(world);
+
             // TODO: handle scenario where current tick is in future. remove the .unwrap()
             let tick_record = sent_events.game_events.get_mut(current_tick as usize).unwrap();
             let mut drive_world = true;
@@ -438,10 +449,10 @@ pub fn drain_server_events(
                 let first = game_events.first().unwrap();
                 if first.0==current_tick {
                     drive_world = false;
-                    tick_record.player_actions.insert(first.1.clone());
+                    let added = tick_record.player_actions.insert(first.1.clone());
                     match first.1 {
                         PlayerAction::Movement { player_id, x, y } => {
-                            for (_entity, player, mut vel, mut accel, mut rotation, _) in &mut query {
+                            for (_entity, player, mut vel, mut accel, mut rotation, mut transform) in &mut query {
                                 if player.player_id == player_id {
                                     vel.x = x.0;
                                     vel.z = y.0;
@@ -449,8 +460,16 @@ pub fn drain_server_events(
                                     // Point the player (and its anchored L) toward the movement
                                     // direction. Forward is -Z, so yaw = atan2(-x, -z). Leave the
                                     // facing unchanged when stationary.
+                                    //
+                                    // Set BOTH the physics `Rotation` (source of truth used by
+                                    // collision/broadphase, i.e. where the blades are) AND the
+                                    // render `Transform`. If only `Rotation` were set, the next
+                                    // `run_schedule(PhysicsSchedule)` below would reconcile it
+                                    // against the stale `Transform` and clobber the new facing.
                                     if Vec3::new(x.0, 0.0, y.0).length_squared() > 1e-6 {
-                                        *rotation = Quat::from_rotation_y(f32::atan2(-x.0, -y.0)).into();
+                                        let yaw = Quat::from_rotation_y(f32::atan2(-x.0, -y.0));
+                                        *rotation = yaw.into();
+                                        transform.rotation = yaw;
                                     }
                                 }
                             }
@@ -466,19 +485,23 @@ pub fn drain_server_events(
                             }
                         }
                     }
+                    game_events.remove(0);
+                    params.apply(world);
                 }
             }
             if drive_world {
-
+                // world.resource_mut::<Time<Physics>>().delta();
+                println!("Running scehdule");
+                world.run_schedule(PhysicsSchedule);
+                println!("Ran scehdule");
+                current_tick += 1;
             }
         }
-    }
     }
 
     // Flush the entity insertions deferred through `commands`; a normal system does
     // this automatically, but an exclusive `&mut World` system must apply its own
     // `SystemState`.
-    params.apply(world);
 }
 
 
@@ -617,6 +640,7 @@ pub fn animate_swing(
     time: Res<Time>,
     mut query: Query<(Entity, &mut Transform, &mut Swinging, &ChildOf), With<Boomerang>>,
 ) {
+    println!("Animating swing");
     for (entity, mut transform, mut swing, child_of) in &mut query {
         swing.elapsed += time.delta_secs();
         let t = (swing.elapsed / SWING_DURATION).clamp(0.0, 1.0);
