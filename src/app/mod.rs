@@ -66,12 +66,17 @@ pub fn run() {
             (
                 move_player,
                 start_swing,
-                animate_swing,
                 tick_swing_cooldown,
                 detect_strikes,
                 apply_dead_collision_layers,
                 animate_death,
             )
+                .run_if(in_state(AppState::Playing)),
+        )
+        .add_systems(
+            PhysicsSchedule,
+            
+                animate_swing.before(PhysicsStepSystems::First)
                 .run_if(in_state(AppState::Playing)),
         )
         .add_systems(
