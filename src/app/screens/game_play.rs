@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::{backtrace::Backtrace, collections::{BTreeMap, BTreeSet}};
 
 use avian3d::{dynamics::integrator::IntegrationSystems::Velocity, prelude::*};
 use bevy::{ecs::{change_detection::Tick, system::SystemState}, prelude::*};
@@ -11,7 +11,6 @@ use crate::{
 #[derive(Component)]
 pub struct Player {
     pub player_id: u8,
-    pub direction: Vec3,
     pub last_direction_event_timestamp: std::time::SystemTime,
 }
 
@@ -108,6 +107,9 @@ pub enum PlayerBoomerangState {
     Stationary,
     Swinging{elapsed: f32},
 }
+
+#[derive(Resource, Default, Clone)]
+pub struct PlayerDirections(BTreeMap<u8, Vec3>);
 
 /// A snapshot of one locally-controlled player's physics at a given tick.
 #[derive(Clone)]
@@ -225,7 +227,7 @@ pub fn setup_game_play(
     // Camera, positioned back and up, looking at the origin.
     commands.spawn((
         Camera3d::default(),
-        Transform::from_xyz(0.0, 5.0, 12.0).looking_at(Vec3::ZERO, Vec3::Y),
+        Transform::from_xyz(0.0, 1.0, 12.0).looking_at(Vec3::ZERO, Vec3::Y),
     ));
 
     // Directional light so the meshes are visible.
@@ -267,7 +269,7 @@ pub fn setup_game_play(
                     // rotation so collisions don't tumble the cube and fight that facing.
                     LockedAxes::ROTATION_LOCKED,
                     ConstantLinearAcceleration(Vec3::ZERO),
-                    Player { player_id: player.id, direction: Vec3::ZERO, last_direction_event_timestamp: std::time::SystemTime::now() },
+                    Player { player_id: player.id, last_direction_event_timestamp: std::time::SystemTime::now() },
                 ))
                 .with_children(|parent| {
                     // The L as a single entity, anchored at the point where it meets the
@@ -385,6 +387,7 @@ pub fn wait_for_start(
             commands.insert_resource(Ticker(0));
             commands.insert_resource(LocalGameEvents::default());
             commands.insert_resource(InReplay::default());
+            commands.insert_resource(PlayerDirections(BTreeMap::new()));
             next_state.set(AppState::Playing);
         }
     }
@@ -436,6 +439,12 @@ pub fn drain_server_events(
             local_game_events.game_events.drain(((first_tick as usize)+1)..);
             existing_records
         };
+        // Apply the despawn/respawn queued by `spawn_world` NOW. The replay loop below
+        // queries entities and queues component inserts against them; without this flush
+        // those queries would still match the old, about-to-be-despawned entities, and any
+        // command targeting them (e.g. the `Swinging` insert) would be dropped when the
+        // despawn finally landed.
+        params.apply(world);
         let final_tick = {
             let ticker = params.get_mut(world).5;
             std::cmp::max(new_player_actions.last().unwrap().0, ticker.0)
@@ -447,9 +456,12 @@ pub fn drain_server_events(
         println!("current_tick: {}, final_tick: {}", current_tick, final_tick);
         while current_tick <= final_tick {
             {
-                let (mut commands, client, mut query, swing_targets, lobjects, mut ticker, mut sent_events, _, _, _, _) =
-                    params.get_mut(world);
+                if !new_player_actions.is_empty() {
+                    println!("New player action: {:?} {:?}", new_player_actions.first().unwrap().0, new_player_actions.first().unwrap().1.clone());
+                }
                 while !new_player_actions.is_empty() && new_player_actions.first().unwrap().0 == current_tick {
+                    let (mut commands, client, mut query, swing_targets, lobjects, mut ticker, mut sent_events, _, _, _, _) =
+                        params.get_mut(world);
                     let first = new_player_actions.first().unwrap();
                     {
                         record_player_action(&client, &ticker, &mut sent_events, &first.1, false);
@@ -492,10 +504,13 @@ pub fn drain_server_events(
                         }
                     }
                     new_player_actions.remove(0);
+                    params.apply(world);
                 }
                 {
                     if !existing_records.is_empty() {
                         for player_action in existing_records.first().unwrap().player_actions.iter() {
+                            let (mut commands, client, mut query, swing_targets, lobjects, mut ticker, mut sent_events, _, _, _, _) =
+                                params.get_mut(world);
                             match player_action {
                                 PlayerAction::Movement { player_id, x, y } => {
                                     for (_entity, player, mut vel, mut accel, mut rotation, mut transform) in &mut query {
@@ -532,14 +547,13 @@ pub fn drain_server_events(
                                 }
                             }
                         }
+                        params.apply(world);
                     }
                 }
             }
-            {
-                params.apply(world);
-            }
             println!("Running scehdule");
             world.run_schedule(PhysicsSchedule);
+            params.apply(world);
             println!("Ran scehdule");
             if !existing_records.is_empty() {
                 let (_, client, _, _, _, _, mut local_game_events, _, _, _, _) = params.get_mut(world);
@@ -561,7 +575,10 @@ pub fn drain_server_events(
         {
             let (_, _, _, _, _, _, _, _, _, _, mut in_replay) = params.get_mut(world);
             in_replay.0 = false;
-        };
+        }
+        {
+            params.apply(world);
+        }
     }
 
     // Flush the entity insertions deferred through `commands`; a normal system does
@@ -585,10 +602,12 @@ pub fn move_player(
     ticker: Res<Ticker>,
     mut sent_events: ResMut<LocalGameEvents>,
     mut query: Query<(&mut Player, &Transform, &LinearVelocity, &Rotation, &ConstantLinearAcceleration), Without<Dead>>,
+    mut player_directions: ResMut<PlayerDirections>,
 ) {
 
     // Snapshot this client's local roster (player_id -> controller), releasing the
     // lock before we touch the ECS.
+    println!("Running");
     let roster: Vec<(u8, Controller)> = {
         let client = client.client.read().unwrap();
         let players = client.players.read().unwrap();
@@ -635,11 +654,15 @@ pub fn move_player(
     for (player_id, velocity) in moves {
         for (mut player, ..) in &mut query {
             if player.player_id == player_id {
-                let direction_changed = player.direction != velocity;
+                if !player_directions.0.contains_key(&player_id) {
+                    player_directions.0.insert(player_id, Vec3::ZERO);
+                }
+                let direction = player_directions.0.get_mut(&player_id).unwrap();
+                let direction_changed = direction.clone() != velocity;
                 // let interval_elapsed = player.last_direction_event_timestamp.elapsed().unwrap().as_millis() >= DIRECTION_EVENT_INTERVAL;
                 let interval_elapsed = false;
                 if direction_changed || interval_elapsed {
-                    player.direction = velocity;
+                    *direction = velocity;
                     player.last_direction_event_timestamp = std::time::SystemTime::now();
                     let game_event = PlayerAction::Movement { player_id, x: OrderedF32(velocity.x), y: OrderedF32(velocity.z) };
                     record_player_action(&client, &ticker, &mut sent_events, &game_event, true);
@@ -880,6 +903,7 @@ pub fn record_player_action(
     player_action: &PlayerAction,
     send_to_server: bool,
 ) {
+    // println!("Here?: {:?}", Backtrace::capture());
     if let Some(sender) = &client.client.read().unwrap().sender {
         sent_events.insert_received_player_actions( vec![ (ticker.0, player_action.clone()) ]);
         if send_to_server {
@@ -919,7 +943,10 @@ pub fn spawn_world(commands: &mut Commands, materials: &mut ResMut<Assets<Standa
             .spawn((
                 Mesh3d(meshes.add(Cylinder::new(0.5, 1.0))),
                 MeshMaterial3d(materials.add(Color::srgb(0.8, 0.3, 0.3))),
-                Transform::from_translation(player.position).rotate(player.rotation),
+                // NB: `.rotate()` mutates and returns `()` (which is a valid empty Bundle,
+                // so it compiles but silently inserts no Transform at all) — the builder
+                // form `.with_rotation()` is required here.
+                Transform::from_translation(player.position).with_rotation(player.rotation),
                 RigidBody::Dynamic,
                 Collider::cylinder(0.5, 1.0),
                 // Facing is driven manually (see `drain_server_events`); lock physics
@@ -927,18 +954,24 @@ pub fn spawn_world(commands: &mut Commands, materials: &mut ResMut<Assets<Standa
                 LockedAxes::ROTATION_LOCKED,
                 ConstantLinearAcceleration(player.acceleration),
                 LinearVelocity(player.velocity),
-                Player { player_id: player.player_id, direction: Vec3::ZERO, last_direction_event_timestamp: std::time::SystemTime::now() },
+                Player { player_id: player.player_id, last_direction_event_timestamp: std::time::SystemTime::now() },
             ))
             .with_children(|parent| {
                 // The L as a single entity, anchored at the point where it meets the
                 // cube (the right face, local x = 0.5). Its segments are positioned
                 // relative to this anchor.
-                parent
-                    .spawn((
-                        Boomerang,
-                        Transform::from_xyz(0.5, 0.0, 0.0),
-                        Visibility::default(),
-                    ))
+                let mut boomerang = parent.spawn((
+                    Boomerang,
+                    Transform::from_xyz(0.5, 0.0, 0.0),
+                    Visibility::default(),
+                ));
+                // Restore an in-flight swing from the snapshot. `animate_swing` derives the
+                // boomerang transform entirely from `elapsed`, so the component alone is
+                // enough; the pose corrects itself on the next physics step.
+                if let Some(PlayerBoomerangState::Swinging { elapsed }) = player.bommerang {
+                    boomerang.insert(Swinging { elapsed });
+                }
+                boomerang
                     .with_children(|l| {
                         // L spine: runs along +X out from the anchor (cube right face).
                         l.spawn((
