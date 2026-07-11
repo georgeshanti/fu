@@ -75,8 +75,8 @@ pub fn run() {
         .add_systems(
             PhysicsSchedule,
             (
-                animate_swing.before(PhysicsStepSystems::First),
-                detect_strikes.after(animate_swing),
+                animate_swing.before(detect_strikes),
+                detect_strikes.before(PhysicsStepSystems::First),
                 record_tick_state.after(PhysicsStepSystems::Last),
             )
                 .run_if(in_state(AppState::Playing)),

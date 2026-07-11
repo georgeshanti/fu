@@ -410,7 +410,7 @@ pub fn drain_server_events(
         ResMut<InReplay>,
     )>>,
 ) {
-    let mut game_events = {
+    let mut new_player_actions = {
         let client = params.get_mut(world).1;
         let client = client.client.read().unwrap();
         let events = {
@@ -423,9 +423,10 @@ pub fn drain_server_events(
         game_events.sort_by(|a, b| {a.0.cmp(&b.0)});
         game_events
     };
-    if !game_events.is_empty() {
-        let existing_records = {
-            let first_tick = game_events.first().unwrap().0 - 1;
+    if !new_player_actions.is_empty() {
+        let mut existing_records = {
+            println!("Stuff: {}", new_player_actions.first().unwrap().0);
+            let first_tick = new_player_actions.first().unwrap().0 - 1;
             let (mut commands, _, _, _, _, mut ticker, mut local_game_events, players, mut meshes, mut materials, mut in_replay) = params.get_mut(world);
             let game_state = local_game_events.game_events.get(first_tick as usize).unwrap().game_state.clone();
             spawn_world(&mut commands, &mut materials, &mut meshes, players, game_state);
@@ -437,64 +438,123 @@ pub fn drain_server_events(
         };
         let final_tick = {
             let ticker = params.get_mut(world).5;
-            std::cmp::max(game_events.last().unwrap().0, ticker.0)
+            std::cmp::max(new_player_actions.last().unwrap().0, ticker.0)
         };
         let mut current_tick = {
             let (_, _, _, _, _, ticker, _, players, mut meshes, mut materials, mut in_replay) = params.get_mut(world);
             ticker.0
         };
+        println!("current_tick: {}, final_tick: {}", current_tick, final_tick);
         while current_tick <= final_tick {
-            let (mut commands, client, mut query, swing_targets, lobjects, mut ticker, mut sent_events, _, _, _, _) =
-                params.get_mut(world);
-            while !game_events.is_empty() && game_events.first().unwrap().0 == current_tick {
-                let first = game_events.first().unwrap();
-                {
-                    record_player_action(&client, &ticker, &mut sent_events, &first.1);
-                }
-                match first.1 {
-                    PlayerAction::Movement { player_id, x, y } => {
-                        for (_entity, player, mut vel, mut accel, mut rotation, mut transform) in &mut query {
-                            if player.player_id == player_id {
-                                vel.x = x.0;
-                                vel.z = y.0;
-                                *accel = ConstantLinearAcceleration(Vec3::new(x.0, 0.0, y.0).normalize_or_zero() * PLAYER_ACCEL);
-                                // Point the player (and its anchored L) toward the movement
-                                // direction. Forward is -Z, so yaw = atan2(-x, -z). Leave the
-                                // facing unchanged when stationary.
-                                //
-                                // Set BOTH the physics `Rotation` (source of truth used by
-                                // collision/broadphase, i.e. where the blades are) AND the
-                                // render `Transform`. If only `Rotation` were set, the next
-                                // `run_schedule(PhysicsSchedule)` below would reconcile it
-                                // against the stale `Transform` and clobber the new facing.
-                                if Vec3::new(x.0, 0.0, y.0).length_squared() > 1e-6 {
-                                    let yaw = Quat::from_rotation_y(f32::atan2(-x.0, -y.0));
-                                    *rotation = yaw.into();
-                                    transform.rotation = yaw;
+            {
+                let (mut commands, client, mut query, swing_targets, lobjects, mut ticker, mut sent_events, _, _, _, _) =
+                    params.get_mut(world);
+                while !new_player_actions.is_empty() && new_player_actions.first().unwrap().0 == current_tick {
+                    let first = new_player_actions.first().unwrap();
+                    {
+                        record_player_action(&client, &ticker, &mut sent_events, &first.1, false);
+                    }
+                    println!("Replaying player action: {:?}", first.1);
+                    match first.1 {
+                        PlayerAction::Movement { player_id, x, y } => {
+                            for (_entity, player, mut vel, mut accel, mut rotation, mut transform) in &mut query {
+                                if player.player_id == player_id {
+                                    vel.x = x.0;
+                                    vel.z = y.0;
+                                    *accel = ConstantLinearAcceleration(Vec3::new(x.0, 0.0, y.0).normalize_or_zero() * PLAYER_ACCEL);
+                                    // Point the player (and its anchored L) toward the movement
+                                    // direction. Forward is -Z, so yaw = atan2(-x, -z). Leave the
+                                    // facing unchanged when stationary.
+                                    //
+                                    // Set BOTH the physics `Rotation` (source of truth used by
+                                    // collision/broadphase, i.e. where the blades are) AND the
+                                    // render `Transform`. If only `Rotation` were set, the next
+                                    // `run_schedule(PhysicsSchedule)` below would reconcile it
+                                    // against the stale `Transform` and clobber the new facing.
+                                    if Vec3::new(x.0, 0.0, y.0).length_squared() > 1e-6 {
+                                        let yaw = Quat::from_rotation_y(f32::atan2(-x.0, -y.0));
+                                        *rotation = yaw.into();
+                                        transform.rotation = yaw;
+                                    }
+                                }
+                            }
+                        },
+                        PlayerAction::Swing { player_id } => {
+                            for (player, children) in &swing_targets {
+                                if player.player_id != player_id { continue; }
+                                for child in children.iter() {
+                                    if let Ok(boomerang) = lobjects.get(child) {
+                                        println!("Adding swing to player's boomerang");
+                                        commands.entity(boomerang).insert(Swinging { elapsed: 0.0 });
+                                    }
                                 }
                             }
                         }
-                    },
-                    PlayerAction::Swing { player_id } => {
-                        for (player, children) in &swing_targets {
-                            if player.player_id != player_id { continue; }
-                            for child in children.iter() {
-                                if let Ok(boomerang) = lobjects.get(child) {
-                                    commands.entity(boomerang).insert(Swinging { elapsed: 0.0 });
+                    }
+                    new_player_actions.remove(0);
+                }
+                {
+                    if !existing_records.is_empty() {
+                        for player_action in existing_records.first().unwrap().player_actions.iter() {
+                            match player_action {
+                                PlayerAction::Movement { player_id, x, y } => {
+                                    for (_entity, player, mut vel, mut accel, mut rotation, mut transform) in &mut query {
+                                        if player.player_id == *player_id {
+                                            vel.x = x.0;
+                                            vel.z = y.0;
+                                            *accel = ConstantLinearAcceleration(Vec3::new(x.0, 0.0, y.0).normalize_or_zero() * PLAYER_ACCEL);
+                                            // Point the player (and its anchored L) toward the movement
+                                            // direction. Forward is -Z, so yaw = atan2(-x, -z). Leave the
+                                            // facing unchanged when stationary.
+                                            //
+                                            // Set BOTH the physics `Rotation` (source of truth used by
+                                            // collision/broadphase, i.e. where the blades are) AND the
+                                            // render `Transform`. If only `Rotation` were set, the next
+                                            // `run_schedule(PhysicsSchedule)` below would reconcile it
+                                            // against the stale `Transform` and clobber the new facing.
+                                            if Vec3::new(x.0, 0.0, y.0).length_squared() > 1e-6 {
+                                                let yaw = Quat::from_rotation_y(f32::atan2(-x.0, -y.0));
+                                                *rotation = yaw.into();
+                                                transform.rotation = yaw;
+                                            }
+                                        }
+                                    }
+                                },
+                                PlayerAction::Swing { player_id } => {
+                                    for (player, children) in &swing_targets {
+                                        if player.player_id != *player_id { continue; }
+                                        for child in children.iter() {
+                                            if let Ok(boomerang) = lobjects.get(child) {
+                                                commands.entity(boomerang).insert(Swinging { elapsed: 0.0 });
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
                     }
                 }
-                game_events.remove(0);
             }
             {
-                println!("Running scehdule");
-                world.run_schedule(PhysicsSchedule);
-                println!("Ran scehdule");
+                params.apply(world);
+            }
+            println!("Running scehdule");
+            world.run_schedule(PhysicsSchedule);
+            println!("Ran scehdule");
+            if !existing_records.is_empty() {
+                let (_, client, _, _, _, _, mut local_game_events, _, _, _, _) = params.get_mut(world);
+                let old_game_effects = existing_records.first().unwrap().game_effects.clone();
+                let new_game_effects = local_game_events.game_events.get(current_tick as usize).unwrap().game_effects.clone();
+                let missing_game_effects = new_game_effects.difference(&old_game_effects);
+                for game_effect in missing_game_effects {
+                    let _ = client.client.read().unwrap().sender.clone().unwrap().send(ClientEvent::GameEffect { tick: current_tick, game_event: game_effect.clone() });
+                }
+            }
+            if !existing_records.is_empty() {
+                existing_records.remove(0);
             }
             current_tick = {
-                let (mut commands, _, _, _, _, mut ticker, mut local_game_events, players, mut meshes, mut materials, mut in_replay) = params.get_mut(world);
+                let (_, _, _, _, _, ticker, _, _, _, _, _) = params.get_mut(world);
                 ticker.0
             };
         }
@@ -582,7 +642,7 @@ pub fn move_player(
                     player.direction = velocity;
                     player.last_direction_event_timestamp = std::time::SystemTime::now();
                     let game_event = PlayerAction::Movement { player_id, x: OrderedF32(velocity.x), y: OrderedF32(velocity.z) };
-                    record_player_action(&client, &ticker, &mut sent_events, &game_event);
+                    record_player_action(&client, &ticker, &mut sent_events, &game_event, true);
                 }
             }
         }
@@ -614,7 +674,7 @@ pub fn start_swing(
                 for child in children.iter() {
                     if lobjects.get(child).is_ok() {
                         let game_event = PlayerAction::Swing { player_id: *id };
-                        record_player_action(&client, &ticker, &mut sent_events, &game_event);
+                        record_player_action(&client, &ticker, &mut sent_events, &game_event, true);
                     }
                 }
             }
@@ -629,7 +689,7 @@ pub fn start_swing(
             for child in children.iter() {
                 if lobjects.get(child).is_ok() {
                     let game_event = PlayerAction::Swing { player_id: *id };
-                    record_player_action(&client, &ticker, &mut sent_events, &game_event);
+                    record_player_action(&client, &ticker, &mut sent_events, &game_event, true);
                 }
             }
         }
@@ -645,6 +705,7 @@ pub fn animate_swing(
     mut query: Query<(Entity, &mut Transform, &mut Swinging, &ChildOf), With<Boomerang>>,
 ) {
     for (entity, mut transform, mut swing, child_of) in &mut query {
+        println!("Animating swing");
         swing.elapsed += time.delta_secs();
         let t = (swing.elapsed / SWING_DURATION).clamp(0.0, 1.0);
         let angle = SWING_PEAK_ANGLE * (std::f32::consts::PI * t).sin();
@@ -772,7 +833,7 @@ pub fn animate_death(time: Res<Time>, mut query: Query<(&mut Transform, &mut Dea
 /// Must run after those three systems so `sent_events`'s last tick reflects whether
 /// they fired this frame.
 pub fn record_tick_state(
-    ticker: Res<Ticker>,
+    mut ticker: ResMut<Ticker>,
     mut sent_events: ResMut<LocalGameEvents>,
     player_query: Query<(&Player, &Transform, &LinearVelocity, &Rotation, &ConstantLinearAcceleration, &Children)>,
     stationary_boomerangs: Query<&Boomerang, Without<Swinging>>,
@@ -809,19 +870,23 @@ pub fn record_tick_state(
         player_actions: BTreeSet::new(),
         game_effects: BTreeSet::new(),
     });
+    ticker.0 += 1;
 }
 
 pub fn record_player_action(
     client: &Res<GameClientWrapper>,
     ticker: &Ticker,
     sent_events: &mut ResMut<LocalGameEvents>,
-    player_Action: &PlayerAction,
+    player_action: &PlayerAction,
+    send_to_server: bool,
 ) {
     if let Some(sender) = &client.client.read().unwrap().sender {
-        sent_events.insert_received_player_actions( vec![ (ticker.0, player_Action.clone()) ]);
-        sender
-            .send(ClientEvent::PlayerAction { tick: ticker.0, game_event: player_Action.clone() })
-            .ok();
+        sent_events.insert_received_player_actions( vec![ (ticker.0, player_action.clone()) ]);
+        if send_to_server {
+            sender
+                .send(ClientEvent::PlayerAction { tick: ticker.0, game_event: player_action.clone() })
+                .ok();
+        }
     }
 }
 
