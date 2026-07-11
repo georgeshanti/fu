@@ -95,7 +95,7 @@ pub struct Countdown {
 /// Counts `drain_server_events` invocations. Present only while `AppState::Playing`;
 /// stamped onto outgoing `ClientEvent::GameEvent`s in place of the old hardcoded `tick: 0`.
 #[derive(Resource, Default)]
-pub struct Ticker(pub u64);
+pub struct Ticker(pub u64, pub bool);
 
 /// Whether the client is currently replaying past ticks rather than playing live.
 /// Present only while `AppState::Playing`; inserted alongside `Ticker`.
@@ -384,7 +384,7 @@ pub fn wait_for_start(
                 commands.entity(entity).despawn();
             }
             commands.remove_resource::<Countdown>();
-            commands.insert_resource(Ticker(0));
+            commands.insert_resource(Ticker(0, false));
             commands.insert_resource(LocalGameEvents::default());
             commands.insert_resource(InReplay::default());
             commands.insert_resource(PlayerDirections(BTreeMap::new()));
@@ -429,8 +429,9 @@ pub fn drain_server_events(
     if !new_player_actions.is_empty() {
         let mut existing_records = {
             println!("Stuff: {}", new_player_actions.first().unwrap().0);
-            let first_tick = new_player_actions.first().unwrap().0 - 1;
+            let first_tick = new_player_actions.first().unwrap().0;
             let (mut commands, _, _, _, _, mut ticker, mut local_game_events, players, mut meshes, mut materials, mut in_replay) = params.get_mut(world);
+            println!("first tick value: {}", local_game_events.game_events.first().unwrap().tick);
             let game_state = local_game_events.game_events.get(first_tick as usize).unwrap().game_state.clone();
             spawn_world(&mut commands, &mut materials, &mut meshes, players, game_state);
             ticker.0 = first_tick;
@@ -607,7 +608,6 @@ pub fn move_player(
 
     // Snapshot this client's local roster (player_id -> controller), releasing the
     // lock before we touch the ECS.
-    println!("Running");
     let roster: Vec<(u8, Controller)> = {
         let client = client.client.read().unwrap();
         let players = client.players.read().unwrap();
@@ -862,16 +862,21 @@ pub fn record_tick_state(
     stationary_boomerangs: Query<&Boomerang, Without<Swinging>>,
     swinging_boomerangs: Query<(&Boomerang, &Swinging), With<Swinging>>,
 ) {
+    if ticker.1 {
+        ticker.0 += 1;
+    } else {
+        ticker.1 = true;
+    }
     let game_state = GameState{
         players: player_query.iter()
         .map(|(player, transform, velocity, rotation, acceleration, children)| {
             let mut player_boomerang_stationary: Option<PlayerBoomerangState> = None;
             for child in children {
-                if let Ok(boomerang) = stationary_boomerangs.get(*child) {
+                if let Ok(_) = stationary_boomerangs.get(*child) {
                     player_boomerang_stationary = Some(PlayerBoomerangState::Stationary);
                     break;
                 }
-                if let Ok((boomerang, swinging)) = swinging_boomerangs.get(*child) {
+                if let Ok((_, swinging)) = swinging_boomerangs.get(*child) {
                     player_boomerang_stationary = Some(PlayerBoomerangState::Swinging { elapsed: swinging.elapsed });
                     break;
                 }
@@ -893,7 +898,6 @@ pub fn record_tick_state(
         player_actions: BTreeSet::new(),
         game_effects: BTreeSet::new(),
     });
-    ticker.0 += 1;
 }
 
 pub fn record_player_action(
