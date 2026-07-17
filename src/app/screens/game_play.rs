@@ -11,7 +11,6 @@ use crate::{
 #[derive(Component)]
 pub struct Player {
     pub player_id: u8,
-    pub last_direction_event_timestamp: std::time::SystemTime,
 }
 
 /// An L-shaped object held off a player's right side. Spawned as a child of the
@@ -77,7 +76,7 @@ pub struct SwingCooldown {
 const PLAYER_SPEED: f32 = 5.0;
 
 /// Minimum time between movement events when direction is unchanged (keep-alive heartbeat), in seconds.
-const DIRECTION_EVENT_INTERVAL: u128 = 50;
+const DIRECTION_EVENT_INTERVAL: u128 = 500;
 
 /// Quantization factor for joystick axes: 2^7 / 2 = 64 levels per side,
 /// giving 128 discrete steps across the clamped -1..1 range.
@@ -109,7 +108,7 @@ pub enum PlayerBoomerangState {
 }
 
 #[derive(Resource, Default, Clone)]
-pub struct PlayerDirections(BTreeMap<u8, Vec3>);
+pub struct PlayerDirections(BTreeMap<u8, (std::time::SystemTime, Vec3)>);
 
 /// A snapshot of one locally-controlled player's physics at a given tick.
 #[derive(Clone)]
@@ -227,7 +226,7 @@ pub fn setup_game_play(
     // Camera, positioned back and up, looking at the origin.
     commands.spawn((
         Camera3d::default(),
-        Transform::from_xyz(0.0, 1.0, 12.0).looking_at(Vec3::ZERO, Vec3::Y),
+        Transform::from_xyz(0.0, 5.0, 12.0).looking_at(Vec3::ZERO, Vec3::Y),
     ));
 
     // Directional light so the meshes are visible.
@@ -269,7 +268,7 @@ pub fn setup_game_play(
                     // rotation so collisions don't tumble the cube and fight that facing.
                     LockedAxes::ROTATION_LOCKED,
                     ConstantLinearAcceleration(Vec3::ZERO),
-                    Player { player_id: player.id, last_direction_event_timestamp: std::time::SystemTime::now() },
+                    Player { player_id: player.id },
                 ))
                 .with_children(|parent| {
                     // The L as a single entity, anchored at the point where it meets the
@@ -413,6 +412,7 @@ pub fn drain_server_events(
         ResMut<InReplay>,
     )>>,
 ) {
+    // println!("Draining");
     let mut new_player_actions = {
         let client = params.get_mut(world).1;
         let client = client.client.read().unwrap();
@@ -427,6 +427,10 @@ pub fn drain_server_events(
         game_events
     };
     if !new_player_actions.is_empty() {
+        let final_tick = {
+            let ticker = params.get_mut(world).5;
+            std::cmp::max(new_player_actions.last().unwrap().0, ticker.0)
+        };
         let mut existing_records = {
             println!("Stuff: {}", new_player_actions.first().unwrap().0);
             let first_tick = new_player_actions.first().unwrap().0;
@@ -446,10 +450,6 @@ pub fn drain_server_events(
         // command targeting them (e.g. the `Swinging` insert) would be dropped when the
         // despawn finally landed.
         params.apply(world);
-        let final_tick = {
-            let ticker = params.get_mut(world).5;
-            std::cmp::max(new_player_actions.last().unwrap().0, ticker.0)
-        };
         let mut current_tick = {
             let (_, _, _, _, _, ticker, _, players, mut meshes, mut materials, mut in_replay) = params.get_mut(world);
             ticker.0
@@ -547,13 +547,17 @@ pub fn drain_server_events(
                                     }
                                 }
                             }
+                            params.apply(world);
                         }
-                        params.apply(world);
                     }
                 }
             }
             println!("Running scehdule");
-            world.run_schedule(PhysicsSchedule);
+            // Run the full physics frame, not just the inner solver step. Avian's
+            // Transform->Position sync (Prepare), clock advancement, and
+            // Position->Transform writeback all live in FixedPostUpdate around the
+            // PhysicsSchedule; running PhysicsSchedule alone simulates nothing visible.
+            world.run_schedule(FixedPostUpdate);
             params.apply(world);
             println!("Ran scehdule");
             if !existing_records.is_empty() {
@@ -651,19 +655,20 @@ pub fn move_player(
 
     // Apply: route each velocity to its player entity, sending only when the
     // direction changed or the keep-alive interval has elapsed since the last event.
+    let now = std::time::SystemTime::now();
     for (player_id, velocity) in moves {
         for (mut player, ..) in &mut query {
             if player.player_id == player_id {
                 if !player_directions.0.contains_key(&player_id) {
-                    player_directions.0.insert(player_id, Vec3::ZERO);
+                    player_directions.0.insert(player_id, (now, Vec3::ZERO));
                 }
                 let direction = player_directions.0.get_mut(&player_id).unwrap();
-                let direction_changed = direction.clone() != velocity;
-                // let interval_elapsed = player.last_direction_event_timestamp.elapsed().unwrap().as_millis() >= DIRECTION_EVENT_INTERVAL;
-                let interval_elapsed = false;
+                let direction_changed = direction.1.clone() != velocity;
+                let interval_elapsed = direction.0.elapsed().unwrap().as_millis() >= DIRECTION_EVENT_INTERVAL;
+                // let interval_elapsed = false;
                 if direction_changed || interval_elapsed {
-                    *direction = velocity;
-                    player.last_direction_event_timestamp = std::time::SystemTime::now();
+                    *direction = (now, velocity);
+                    direction.0 = now;
                     let game_event = PlayerAction::Movement { player_id, x: OrderedF32(velocity.x), y: OrderedF32(velocity.z) };
                     record_player_action(&client, &ticker, &mut sent_events, &game_event, true);
                 }
@@ -863,7 +868,9 @@ pub fn record_tick_state(
     swinging_boomerangs: Query<(&Boomerang, &Swinging), With<Swinging>>,
 ) {
     if ticker.1 {
+        // println!("Incrementing ticker state from: {}", ticker.0);
         ticker.0 += 1;
+        // println!("Incremented ticker state to: {}", ticker.1);
     } else {
         ticker.1 = true;
     }
@@ -881,6 +888,7 @@ pub fn record_tick_state(
                     break;
                 }
             }
+            println!("Tick: {}, Recording: {:?}", ticker.0, transform.translation);
             PlayerState {
                 player_id: player.player_id,
                 position: transform.translation,
@@ -892,12 +900,14 @@ pub fn record_tick_state(
         })
         .collect()
     };
+    // println!("Adding player state for tick: {}", ticker.0);
     sent_events.add_state(TickRecord {
         tick: ticker.0,
         game_state: game_state,
         player_actions: BTreeSet::new(),
         game_effects: BTreeSet::new(),
     });
+    // println!("Added player state for tick: {}", ticker.0);
 }
 
 pub fn record_player_action(
@@ -907,7 +917,7 @@ pub fn record_player_action(
     player_action: &PlayerAction,
     send_to_server: bool,
 ) {
-    // println!("Here?: {:?}", Backtrace::capture());
+    // println!("Recording player action with tick: {:?}", ticker.0);
     if let Some(sender) = &client.client.read().unwrap().sender {
         sent_events.insert_received_player_actions( vec![ (ticker.0, player_action.clone()) ]);
         if send_to_server {
@@ -958,7 +968,7 @@ pub fn spawn_world(commands: &mut Commands, materials: &mut ResMut<Assets<Standa
                 LockedAxes::ROTATION_LOCKED,
                 ConstantLinearAcceleration(player.acceleration),
                 LinearVelocity(player.velocity),
-                Player { player_id: player.player_id, last_direction_event_timestamp: std::time::SystemTime::now() },
+                Player { player_id: player.player_id },
             ))
             .with_children(|parent| {
                 // The L as a single entity, anchored at the point where it meets the

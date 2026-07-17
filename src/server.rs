@@ -1,6 +1,6 @@
 use bevy::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, sync::{Arc, LazyLock, Mutex, mpsc::{self, Receiver, Sender}}, thread::{self, JoinHandle}};
+use std::{collections::BTreeMap, sync::{Arc, LazyLock, Mutex, mpsc::{self, Receiver, Sender}}, thread::{self, JoinHandle, sleep}, time::Duration};
 
 use crate::connection::server::create_server;
 
@@ -209,6 +209,7 @@ impl GameServer {
     pub fn start_server(&mut self) -> JoinHandle<()> {
         let receiver = self.receiver.clone();
         let clients = self.clients.clone();
+        let clients2 = self.clients.clone();
         let players = self.players.clone();
         let phase = self.phase.clone();
         let pending_client_starts = self.pending_client_starts.clone();
@@ -216,7 +217,7 @@ impl GameServer {
             let receiver = receiver.lock().unwrap();
             loop {
                 let event = receiver.recv().unwrap();
-                let clients = clients.lock().unwrap();
+                let clients_guard = clients.lock().unwrap();
                 println!("Got client event: {:?}", event);
                 match event {
                     ClientEvent::JoinLobby { client_id, name, controller } => {
@@ -226,13 +227,13 @@ impl GameServer {
                             players.push(Player { id, client_id, name, controller, alive: true });
                             players.clone()
                         };
-                        for client in clients.1.values() {
+                        for client in clients_guard.1.values() {
                             let _ = client.send(ServerEvent::LobbyInfo { players: roster.clone() });
                         }
                     }
                     ClientEvent::FetchLobby => {
                         let roster = players.lock().unwrap().clone();
-                        for client in clients.1.values() {
+                        for client in clients_guard.1.values() {
                             let _ = client.send(ServerEvent::LobbyInfo { players: roster.clone() });
                         }
                     }
@@ -250,7 +251,7 @@ impl GameServer {
                                 (player, Vec3::new(x, 6.0, 0.0))
                             })
                             .collect();
-                        for client in clients.1.values() {
+                        for client in clients_guard.1.values() {
                             let _ = client.send(ServerEvent::SpawnPlayers { spawns: spawns.clone() });
                         }
                     }
@@ -259,27 +260,32 @@ impl GameServer {
                         if !pending.contains(&client_id) {
                             pending.push(client_id);
                         }
-                        if pending.len() >= clients.1.len() {
+                        if pending.len() >= clients_guard.1.len() {
                             *phase.lock().unwrap() = GamePhase::RoundPlaying;
-                            for client in clients.1.values() {
+                            for client in clients_guard.1.values() {
                                 let _ = client.send(ServerEvent::StartRound);
                             }
                             pending.clear();
                         }
                     }
                     ClientEvent::PlayerAction { tick, game_event } => {
-                        match game_event {
-                            PlayerAction::Movement{player_id, x, y} => {
-                                for client in clients.1.values() {
-                                    let _ = client.send(ServerEvent::PlayerAction { tick, game_event: PlayerAction::Movement { player_id, x, y }});
+                        let clients = clients2.clone();
+                        std::thread::spawn(move || {
+                            // sleep(Duration::from_millis(50));
+                            let clients = clients.lock().unwrap();
+                            match game_event {
+                                PlayerAction::Movement{player_id, x, y} => {
+                                    for client in clients.1.values() {
+                                        let _ = client.send(ServerEvent::PlayerAction { tick, game_event: PlayerAction::Movement { player_id, x, y }});
+                                    }
+                                }
+                                PlayerAction::Swing { player_id } => {
+                                    for client in clients.1.values() {
+                                        let _ = client.send(ServerEvent::PlayerAction { tick, game_event: PlayerAction::Swing { player_id }});
+                                    }
                                 }
                             }
-                            PlayerAction::Swing { player_id } => {
-                                for client in clients.1.values() {
-                                    let _ = client.send(ServerEvent::PlayerAction { tick, game_event: PlayerAction::Swing { player_id }});
-                                }
-                            }
-                        }
+                        });
                     }
                     ClientEvent::GameEffect { tick, game_event } => {
                         match game_event {
@@ -295,7 +301,7 @@ impl GameServer {
                                     }
                                 };
                                 if relay {
-                                    for client in clients.1.values() {
+                                    for client in clients_guard.1.values() {
                                         let _ = client.send(ServerEvent::GameEffect {tick, game_event: GameEffect::StrikePlayer { struck_id, striker_id }});
                                     }
                                 }
