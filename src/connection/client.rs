@@ -2,10 +2,13 @@ use std::{net::TcpStream, sync::mpsc::{self, Receiver, Sender}, thread};
 use serde::{Serialize, de::DeserializeOwned};
 use tungstenite::{connect, protocol::Role, stream::MaybeTlsStream, Message, WebSocket};
 
-use crate::connection::server::Handshake;
+use crate::connection::server::{Handshake, WS_PATH};
 
 /// Opens a WebSocket connection to `address` (expected as `hostname:port`) and
 /// spawns two threads to pump traffic in each direction.
+///
+/// The connection is established with an ordinary HTTP request to [`WS_PATH`]
+/// that the server upgrades; the server answers its other paths as plain HTTP.
 ///
 /// A reader thread deserializes inbound frames into `Response`s and forwards
 /// them on the response channel, and a writer thread serializes `Request`s from
@@ -19,8 +22,11 @@ where
     Response: DeserializeOwned + Send + 'static,
     Id: Serialize + Send + 'static,
 {
-    let url = format!("ws://{address}");
-    let (websocket, _response) = connect(&url).expect("failed to connect to server");
+    let url = build_ws_url(&address);
+    // `connect` performs the HTTP handshake and fails unless the server answers
+    // 101 Switching Protocols, so a wrong path or a non-game server is caught
+    // here rather than surfacing later as a framing error.
+    let (websocket, _response) = connect(&url).unwrap_or_else(|e| panic!("failed to connect to {url}: {e}"));
 
     let (request_sender, request_receiver) = mpsc::channel::<Request>();
     let (response_sender, response_receiver) = mpsc::channel::<Response>();
@@ -62,7 +68,9 @@ where
     let h = Handshake::<Id> {id: id};
     match serde_json::to_string(&h) {
         Ok(json) => {
-            writer.send(Message::Text(json));
+            if let Err(e) = writer.send(Message::Text(json)) {
+                eprintln!("failed to send handshake: {e}");
+            }
         }
         Err(e) => eprintln!("failed to serialize request: {e}"),
     }
@@ -82,4 +90,25 @@ where
     });
 
     (request_sender, response_receiver)
+}
+
+/// Turns what the player typed on the join screen into a full WebSocket URL.
+///
+/// The join screen asks for a bare `host:port`, which gets the game's
+/// [`WS_PATH`] appended — the server's other paths are plain HTTP and would not
+/// upgrade. Accepting a full URL costs nothing and lets a player paste one,
+/// including an `http(s)://` one copied out of a browser.
+fn build_ws_url(address: &str) -> String {
+    let address = address.trim().trim_end_matches('/');
+    let url = match address.split_once("://") {
+        Some(("http", rest)) => format!("ws://{rest}"),
+        Some(("https", rest)) => format!("wss://{rest}"),
+        Some(_) => address.to_string(), // already ws:// or wss://
+        None => format!("ws://{address}"),
+    };
+    // A path the player spelled out themselves wins over the default endpoint.
+    let has_path = url
+        .split_once("://")
+        .is_some_and(|(_, rest)| rest.contains('/'));
+    if has_path { url } else { format!("{url}{WS_PATH}") }
 }

@@ -1010,3 +1010,32 @@ pub fn spawn_world(commands: &mut Commands, materials: &mut ResMut<Assets<Standa
             });
     }
 }
+
+// pub fn get_new_actions(params: &mut Local<SystemState<(
+//         Commands,
+//         Res<GameClientWrapper>,
+//         Query<(Entity, &Player, &mut LinearVelocity, &mut ConstantLinearAcceleration, &mut Rotation, &mut Transform), Without<Dead>>,
+//         Query<(&Player, &Children), Without<Dead>>,
+//         Query<Entity, (With<Boomerang>, Without<Swinging>)>,
+//         ResMut<Ticker>,
+//         ResMut<LocalGameEvents>,
+//         Query<Entity, With<Player>>,
+//         ResMut<Assets<Mesh>>,
+//         ResMut<Assets<StandardMaterial>>,
+//         ResMut<InReplay>,
+//     )>>,
+//     world: &mut World,
+//     existing_actions: Vec<>
+// ) -> Vec<(u64, PlayerAction)> {
+//     let client = params.get_mut(world).1;
+//     let client = client.client.read().unwrap();
+//     let events = {
+//         let mut server_events = client.received_events.lock().unwrap();
+//         let events = server_events.clone();
+//         *server_events = vec![];
+//         events
+//     };
+//     let mut game_events: Vec<(u64, PlayerAction)> = events.iter().filter_map(|event| { if let ServerEvent::PlayerAction{tick: tick, game_event: game_event} = event { Some((*tick, game_event.clone())) } else { None } }).collect();
+//     game_events.sort_by(|a, b| {a.0.cmp(&b.0)});
+//     game_events
+// }

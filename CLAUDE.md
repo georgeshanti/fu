@@ -30,7 +30,7 @@ menu's "Create Game" button; binds `ws://0.0.0.0:8765`, hardcoded, no TLS).
 | `src/app/common/text.rs` | Reusable text-input widget (`InputField`, `InputText`, `focus_input_field`, `update_input`) |
 | `src/server.rs` | `GameServer` (threaded event-loop relay) **and the shared wire protocol**: `ServerEvent`, `ClientEvent`, `Player`, `Controller`. Globals `GAME_SERVER` / `CLIENT_EVENT_SENDER` back the in-process server. |
 | `src/client.rs` | `GameClient`: inbound events buffered in `received_events`, drained per-frame by Bevy systems |
-| `src/connection/{server,client}.rs` | Generic WebSocket transport (`create_server::<Req,Resp,Id>` / `create_client`), `Handshake<Id>` as first frame, JSON text frames |
+| `src/connection/{server,client}.rs` | Generic WebSocket transport (`create_server::<Req,Resp,Id>` / `create_client`), `Handshake<Id>` as first frame, JSON text frames. `server.rs` is also a minimal HTTP server: it parses the request head with `httparse` and only upgrades `GET /ws`; other paths are answered as plain HTTP by `http_route` (add routes there). |
 
 ### Sync model
 
