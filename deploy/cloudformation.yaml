@@ -167,32 +167,9 @@ Resources:
           # needs these shared libs present.
           export DEBIAN_FRONTEND=noninteractive
           apt-get update
-          apt-get install -y libasound2t64 libudev1 libwayland-client0 libxkbcommon0
-
-          useradd --system --home-dir /opt/fu --shell /usr/sbin/nologin fu || true
-          mkdir -p /opt/fu
-          curl -fsSL --retry 5 -o /opt/fu/fu "${BinaryUrl}"
-          chmod +x /opt/fu/fu
-          chown -R fu:fu /opt/fu
-
-          cat > /etc/systemd/system/fu.service <<'EOF'
-          [Unit]
-          Description=fu dedicated game server (ws://0.0.0.0:8765)
-          After=network-online.target
-          Wants=network-online.target
-
-          [Service]
-          ExecStart=/opt/fu/fu --server
-          User=fu
-          Restart=always
-          RestartSec=2
-
-          [Install]
-          WantedBy=multi-user.target
-          EOF
-
-          systemctl daemon-reload
-          systemctl enable --now fu
+          apt-get install -y libasound2t64 libudev1 libwayland-client0 libxkbcommon0 curl unzip
+          curl -fsSL https://awscli.amazonaws.com/v2/install.sh | bash -s -- --system
+          echo "PATH=/usr/local/bin:\$PATH" > /root/.bashrc
 
   # Stable address that survives instance stop/start.
   PublicIp:

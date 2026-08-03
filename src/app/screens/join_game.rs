@@ -20,6 +20,10 @@ pub struct JoinOnlineServerButton;
 #[derive(Component)]
 pub struct JoinLocalServerButton;
 
+/// Marks the "Paste" button that overwrites the game-code field with the clipboard.
+#[derive(Component)]
+pub struct PasteButton;
+
 /// Builds the join-game screen: a 2D camera, a text input field, and a "Join"
 /// button. Typing is handled by `update_join_input`; the button starts the game.
 pub fn setup_join_screen(mut commands: Commands) {
@@ -49,24 +53,51 @@ pub fn setup_join_screen(mut commands: Commands) {
                     TextColor(Color::srgb(0.7, 0.7, 0.7)),
                 ));
 
-                let mut field = parent.spawn((
-                    Button,
-                    Node {
-                        width: Val::Px(300.0),
-                        height: Val::Px(50.0),
-                        justify_content: JustifyContent::Center,
+                // The field sits on a row with its "Paste" button, so the button
+                // reads as belonging to the field rather than to the form.
+                parent
+                    .spawn(Node {
+                        flex_direction: FlexDirection::Row,
                         align_items: AlignItems::Center,
+                        column_gap: Val::Px(10.0),
                         ..default()
-                    },
-                    BackgroundColor(Color::srgb(0.15, 0.15, 0.18)),
-                    InputField::default(),
-                ));
-                if focused {
-                    field.insert(TextInputFocused);
-                }
-                field.with_children(|field| {
-                    field.spawn((Text::new(""), TextColor(Color::WHITE), InputText));
-                });
+                    })
+                    .with_children(|row| {
+                        let mut field = row.spawn((
+                            Button,
+                            Node {
+                                width: Val::Px(300.0),
+                                height: Val::Px(50.0),
+                                justify_content: JustifyContent::Center,
+                                align_items: AlignItems::Center,
+                                ..default()
+                            },
+                            BackgroundColor(Color::srgb(0.15, 0.15, 0.18)),
+                            InputField::default(),
+                        ));
+                        if focused {
+                            field.insert(TextInputFocused);
+                        }
+                        field.with_children(|field| {
+                            field.spawn((Text::new(""), TextColor(Color::WHITE), InputText));
+                        });
+
+                        row.spawn((
+                            Button,
+                            Node {
+                                width: Val::Px(90.0),
+                                height: Val::Px(50.0),
+                                justify_content: JustifyContent::Center,
+                                align_items: AlignItems::Center,
+                                ..default()
+                            },
+                            BackgroundColor(Color::srgb(0.2, 0.2, 0.25)),
+                            PasteButton,
+                        ))
+                        .with_children(|button| {
+                            button.spawn((Text::new("Paste"), TextColor(Color::WHITE)));
+                        });
+                    });
             }
 
             // Join button.
@@ -157,6 +188,30 @@ pub fn handle_join_local_server_button(
             game_client.client.read().unwrap().start_client();
             commands.insert_resource(game_client);
             next_state.set(AppState::Lobby);
+        }
+    }
+}
+
+/// Replaces the game-code field's contents with the system clipboard when the
+/// "Paste" button is pressed. The clipboard handle is opened per press — pastes
+/// are rare, and holding one across frames would need a non-`Sync` resource.
+/// Trailing whitespace/newlines are stripped, since a copied address usually
+/// carries them and they would break the connect string.
+pub fn handle_paste_button(
+    interactions: Query<&Interaction, (Changed<Interaction>, With<PasteButton>)>,
+    mut input_field: Query<&mut InputField>,
+) {
+    for interaction in &interactions {
+        if *interaction != Interaction::Pressed {
+            continue;
+        }
+        match arboard::Clipboard::new().and_then(|mut clipboard| clipboard.get_text()) {
+            Ok(text) => {
+                if let Ok(mut field) = input_field.single_mut() {
+                    field.set_value(text.trim());
+                }
+            }
+            Err(error) => warn!("could not read the clipboard: {error}"),
         }
     }
 }

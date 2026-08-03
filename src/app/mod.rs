@@ -35,7 +35,13 @@ pub fn run() {
         .add_systems(OnEnter(AppState::JoinGame), setup_join_screen)
         .add_systems(
             Update,
-            (focus_input_field, update_input, handle_join_online_submit_button, handle_join_local_server_button)
+            (
+                focus_input_field,
+                update_input,
+                handle_paste_button,
+                handle_join_online_submit_button,
+                handle_join_local_server_button,
+            )
                 .run_if(in_state(AppState::JoinGame)),
         )
         .add_systems(OnExit(AppState::JoinGame), cleanup_join_screen)

@@ -13,6 +13,12 @@ impl InputField {
     pub fn value(&self) -> &str {
         &self.value
     }
+
+    /// Replaces the field's contents wholesale (used by the join screen's paste
+    /// button). The displayed `Text` catches up on the next `update_input` run.
+    pub fn set_value(&mut self, value: impl Into<String>) {
+        self.value = value.into();
+    }
 }
 
 /// Marks the `Text` entity that displays a join input field's contents.
