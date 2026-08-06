@@ -1,8 +1,8 @@
-use std::{sync::{Arc, RwLock}, thread};
+use std::{sync::{Arc, Mutex, RwLock, mpsc}, thread};
 
 use bevy::prelude::*;
 
-use crate::{app::{GameClientWrapper, common::text::{InputField, InputText, TextInputFocused}, screens::app_state::AppState}, client::GameClient, connection::client::create_client, server::{CLIENT_EVENT_SENDER, ClientEvent, GAME_SERVER, ServerEvent, is_game_server_running}};
+use crate::{app::{GameClientWrapper, common::text::{InputField, InputText, TextInputFocused}, screens::app_state::AppState}, client::GameClient, connection::client::create_client, server::{CLIENT_EVENT_SENDER, ClientEvent, ClientEventOuter, GAME_SERVER, ServerEvent, is_game_server_running}};
 
 /// Marks the root UI node of the join-game screen, so it can be despawned on exit.
 #[derive(Component)]
@@ -179,12 +179,37 @@ pub fn handle_join_local_server_button(
 ) {
     for interaction in &interactions {
         if *interaction == Interaction::Pressed {
+            let local_client_id: Arc<Mutex<Option<u8>>> = Arc::new(Mutex::new(None));
             let (game_client, sender) = GameClient::new();
+            let (server_event_sender, server_event_receiver) = mpsc::channel::<ServerEvent>();
+            let local_client_id_1 = local_client_id.clone();
+            thread::spawn(move || {
+                loop {
+                    let server_event = server_event_receiver.recv().unwrap();
+                    match server_event {
+                        ServerEvent::ClientRegistered { client_id } => {
+                            *local_client_id_1.lock().unwrap() = Some(client_id);
+                        },
+                        _ => {},
+                    }
+                    sender.send(server_event);
+                }
+            });
             let game_client = GameClientWrapper{client: Arc::new(RwLock::new(game_client))};
             {
-                GAME_SERVER.lock().unwrap().as_mut().unwrap().attach_sender(sender, None);
+                GAME_SERVER.lock().unwrap().as_mut().unwrap().attach_sender(server_event_sender, None);
             }
-            game_client.client.write().unwrap().attach_sender(CLIENT_EVENT_SENDER.lock().unwrap().as_ref().unwrap().clone());
+            let (client_event_sender, client_event_receiver) = mpsc::channel::<ClientEvent>();
+            let local_client_id_2 = local_client_id.clone();
+            thread::spawn(move || {
+                loop {
+                    let client_event = client_event_receiver.recv().unwrap();
+                    let local_client_id = local_client_id_2.lock().unwrap().unwrap();
+                    let client_event_sender = CLIENT_EVENT_SENDER.lock().unwrap();
+                    client_event_sender.as_ref().unwrap().send(ClientEventOuter {client_id: local_client_id, client_event_inner: client_event.clone()});
+                }
+            });
+            game_client.client.write().unwrap().attach_sender(client_event_sender);
             game_client.client.read().unwrap().start_client();
             commands.insert_resource(game_client);
             next_state.set(AppState::Lobby);

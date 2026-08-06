@@ -1,11 +1,11 @@
 use bevy::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, sync::{Arc, LazyLock, Mutex, mpsc::{self, Receiver, Sender}}, thread::{self, JoinHandle, sleep}, time::Duration};
+use std::{collections::{BTreeMap, BTreeSet}, sync::{Arc, LazyLock, Mutex, mpsc::{self, Receiver, Sender}}, thread::{self, JoinHandle, sleep}, time::Duration};
 
-use crate::connection::server::create_server;
+use crate::{connection::server::create_server, server::ServerEvent::GameStateRequest};
 
 pub static GAME_SERVER: Mutex<Option<GameServer>> = Mutex::new(None);
-pub static CLIENT_EVENT_SENDER: Mutex<Option<Sender<ClientEvent>>> = Mutex::new(None);
+pub static CLIENT_EVENT_SENDER: Mutex<Option<Sender<ClientEventOuter>>> = Mutex::new(None);
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct OrderedF32(pub f32);
@@ -61,8 +61,7 @@ pub fn create_game_server() {
     println!("Here2");
 
     // Network server: inbound = ClientEvent, outbound = ServerEvent.
-    let (request_receiver, client_receiver, _kill_sender) =
-        create_server::<ClientEvent, ServerEvent, u8>();
+    let (request_receiver, client_receiver, _kill_sender) = create_server();
 
     // Thread 1: forward inbound network requests into the game server's channel,
     // i.e. the sender handed back by GameServer::new().
@@ -100,11 +99,36 @@ pub fn is_game_server_running() -> bool {
     GAME_SERVER.lock().unwrap().is_some()
 }
 
+#[derive(PartialEq)]
 enum GamePhase {
     Lobby,
     RoundStarting,
     RoundPlaying,
+    RoundScore,
     RoundEnded,
+    GameEnded,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum PlayerBoomerangState {
+    Stationary,
+    Swinging{elapsed: f32},
+}
+
+/// A snapshot of one locally-controlled player's physics at a given tick.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PlayerState {
+    pub player_id: u8,
+    pub position: Vec3,
+    pub velocity: Vec3,
+    pub rotation: Quat,
+    pub acceleration: Vec3,
+    pub bommerang: Option<PlayerBoomerangState>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GameState {
+    pub players: Vec<PlayerState>,
 }
 
 /// Events originating from the server, sent out to clients.
@@ -120,6 +144,14 @@ pub enum ServerEvent {
     StartRound,
     PlayerAction {tick: u64, game_event: PlayerAction},
     GameEffect {tick: u64, game_event: GameEffect},
+    GameStateRequest,
+    OverrideGameState {tick: u64, game_state: GameState},
+}
+
+#[derive(Event, Debug, Clone, Serialize, Deserialize)]
+pub struct ClientEventOuter {
+    pub client_id: u8,
+    pub client_event_inner: ClientEvent,
 }
 
 /// Events originating from a client, sent to the server.
@@ -135,6 +167,8 @@ pub enum ClientEvent {
     PlayersSpawned { client_id: u8 },
     PlayerAction {tick: u64, game_event: PlayerAction},
     GameEffect {tick: u64, game_event: GameEffect},
+    UndoGameEffect {tick: u64, game_event: GameEffect},
+    GameStateResponse {tick: u64, game_state: GameState},
 }
 
 #[derive(Event, Debug, Clone, Serialize, Deserialize, PartialEq, PartialOrd, Eq, Ord)]
@@ -175,11 +209,14 @@ pub struct GameServer {
     /// Client ids that have reported PlayersSpawned for the current round.
     pub pending_client_starts: Arc<Mutex<Vec<u8>>>,
     /// Channel of inbound events arriving from clients.
-    pub receiver: Arc<Mutex<Receiver<ClientEvent>>>,
+    pub receiver: Arc<Mutex<Receiver<ClientEventOuter>>>,
+    pub game_effects: Arc<Mutex<BTreeMap<u64, BTreeMap<GameEffect, BTreeSet<u8>>>>>,
+    pub latest_tick_received: Arc<Mutex<Option<(u8, u64)>>>,
+    pub clients_to_override: Arc<Mutex<Vec<u8>>>,
 }
 
 impl GameServer {
-    pub fn new() -> (Self, Sender<ClientEvent>) {
+    pub fn new() -> (Self, Sender<ClientEventOuter>) {
         let (sender, receiver) = mpsc::channel();
         let server = GameServer {
             phase: Arc::new(Mutex::new(GamePhase::Lobby)),
@@ -187,6 +224,9 @@ impl GameServer {
             clients: Arc::new(Mutex::new((0, BTreeMap::new()))),
             pending_client_starts: Arc::new(Mutex::new(Vec::new())),
             receiver: Arc::new(Mutex::new(receiver)),
+            game_effects: Arc::new(Mutex::new(BTreeMap::new())),
+            latest_tick_received: Arc::new(Mutex::new(None)),
+            clients_to_override: Arc::new(Mutex::new(Vec::new())),
         };
         (server, sender)
     }
@@ -201,7 +241,7 @@ impl GameServer {
                 let id = clients.0;
                 clients.0 += 1;
                 let _ = sender.send(ServerEvent::ClientRegistered { client_id: id });
-                clients.1.insert(id, sender);
+                clients.1.insert(id, sender); 
             }
         }
     }
@@ -213,14 +253,19 @@ impl GameServer {
         let players = self.players.clone();
         let phase = self.phase.clone();
         let pending_client_starts = self.pending_client_starts.clone();
+        let game_effects = self.game_effects.clone();
+        let last_received_tick = self.latest_tick_received.clone();
+        let clients_to_override = self.clients_to_override.clone();
         thread::spawn(move || {
             let receiver = receiver.lock().unwrap();
             loop {
                 let event = receiver.recv().unwrap();
                 let clients_guard = clients.lock().unwrap();
                 println!("Got client event: {:?}", event);
-                match event {
+                let mut phase = phase.lock().unwrap();
+                match event.client_event_inner {
                     ClientEvent::JoinLobby { client_id, name, controller } => {
+                        if *phase != GamePhase::Lobby { continue };
                         let roster = {
                             let mut players = players.lock().unwrap();
                             let id = players.len() as u8;
@@ -232,13 +277,15 @@ impl GameServer {
                         }
                     }
                     ClientEvent::FetchLobby => {
+                        if *phase != GamePhase::Lobby { continue };
                         let roster = players.lock().unwrap().clone();
                         for client in clients_guard.1.values() {
                             let _ = client.send(ServerEvent::LobbyInfo { players: roster.clone() });
                         }
                     }
                     ClientEvent::StartGame => {
-                        *phase.lock().unwrap() = GamePhase::RoundStarting;
+                        if *phase != GamePhase::Lobby { continue };
+                        *phase = GamePhase::RoundStarting;
                         pending_client_starts.lock().unwrap().clear();
                         let roster = players.lock().unwrap().clone();
                         let n = roster.len();
@@ -256,12 +303,13 @@ impl GameServer {
                         }
                     }
                     ClientEvent::PlayersSpawned { client_id } => {
+                        if *phase != GamePhase::RoundStarting { continue };
                         let mut pending = pending_client_starts.lock().unwrap();
                         if !pending.contains(&client_id) {
                             pending.push(client_id);
                         }
                         if pending.len() >= clients_guard.1.len() {
-                            *phase.lock().unwrap() = GamePhase::RoundPlaying;
+                            *phase = GamePhase::RoundPlaying;
                             for client in clients_guard.1.values() {
                                 let _ = client.send(ServerEvent::StartRound);
                             }
@@ -269,6 +317,24 @@ impl GameServer {
                         }
                     }
                     ClientEvent::PlayerAction { tick, game_event } => {
+                        if *phase != GamePhase::RoundPlaying { continue };
+                        {
+                            let mut last_received_tick = last_received_tick.lock().unwrap();
+                            if last_received_tick.is_none() {
+                                *last_received_tick = Some((event.client_id, tick))
+                            } else if let Some((last_client_id, last_tick)) = *last_received_tick {
+                                if last_tick < tick {
+                                    *last_received_tick = Some((event.client_id, tick))
+                                } else if last_tick > tick + 1000 {
+                                    {
+                                        let mut clients_to_override = clients_to_override.lock().unwrap();
+                                        clients_to_override.push(event.client_id);
+                                        let clients = clients.lock().unwrap();
+                                        clients.1.get(&last_client_id).unwrap().send(GameStateRequest).unwrap();
+                                    }
+                                }
+                            }
+                        }
                         let clients = clients2.clone();
                         std::thread::spawn(move || {
                             // sleep(Duration::from_millis(50));
@@ -288,6 +354,15 @@ impl GameServer {
                         });
                     }
                     ClientEvent::GameEffect { tick, game_event } => {
+                        if *phase != GamePhase::RoundPlaying { continue };
+                        let mut game_effects = game_effects.lock().unwrap();
+                        if !game_effects.contains_key(&tick) {
+                            game_effects.insert(tick, BTreeMap::new());
+                        }
+                        if !game_effects.get(&tick).unwrap().contains_key(&game_event) {
+                            game_effects.get_mut(&tick).unwrap().insert(game_event.clone(), BTreeSet::new());
+                        }
+                        game_effects.get_mut(&tick).unwrap().get_mut(&game_event).unwrap().insert(event.client_id);
                         match game_event {
                             GameEffect::StrikePlayer { struck_id, striker_id } => {
                                 // Only relay on the alive->dead transition, so the many
@@ -307,6 +382,23 @@ impl GameServer {
                                 }
                             }
                         }
+                    }
+                    ClientEvent::UndoGameEffect { tick, game_event } => {
+                        if *phase != GamePhase::RoundPlaying { continue };
+                        let mut game_effects = game_effects.lock().unwrap();
+                        if game_effects.contains_key(&tick) {
+                            if game_effects.get(&tick).unwrap().contains_key(&game_event) {
+                                game_effects.get_mut(&tick).unwrap().get_mut(&game_event).unwrap().remove(&event.client_id);
+                            }
+                        }
+                    }
+                    ClientEvent::GameStateResponse { tick, game_state } => {
+                        let mut clients_to_override = clients_to_override.lock().unwrap();
+                        let clients = clients.lock().unwrap();
+                        for client_id in clients_to_override.iter() {
+                            clients.1.get(&client_id).unwrap().send(ServerEvent::OverrideGameState { tick, game_state: game_state.clone() }).unwrap();
+                        }
+                        clients_to_override.clear();
                     }
                 }
             }

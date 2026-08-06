@@ -1,12 +1,11 @@
 use std::{
-    io::{self, Read, Write},
-    net::{TcpListener, TcpStream},
-    sync::mpsc::{self, Receiver, Sender},
-    thread,
+    io::{self, Read, Write}, net::{TcpListener, TcpStream}, sync::{Arc, Mutex, mpsc::{self, Receiver, Sender}}, thread,
 };
 use bevy::ecs::event::Event;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tungstenite::{Message, WebSocket, handshake::derive_accept_key, protocol::Role};
+
+use crate::server::{ClientEvent, ClientEventOuter, ServerEvent};
 
 /// Address the game server listens on. Plain HTTP, no TLS.
 const LISTEN_ADDR: &str = "0.0.0.0:8765";
@@ -48,16 +47,11 @@ pub struct Handshake<Id> {
     pub id: Option<Id>,
 }
 
-pub fn create_server<Request, Response, Id>()
-    -> (Receiver<Request>, Receiver<(Option<Id>, Sender<Response>)>, Sender<()>)
-where
-    Request: DeserializeOwned + Send + 'static,
-    Response: Serialize + Send + 'static,
-    Id: DeserializeOwned + Send + 'static,
-{
+pub fn create_server()
+    -> (Receiver<ClientEventOuter>, Receiver<(Option<u8>, Sender<ServerEvent>)>, Sender<()>) {
     let listener = TcpListener::bind(LISTEN_ADDR).expect("failed to bind to port 8765");
-    let (request_sender, request_receiver) = mpsc::channel::<Request>();
-    let (client_sender, client_receiver) = mpsc::channel::<(Option<Id>, Sender<Response>)>();
+    let (request_sender, request_receiver) = mpsc::channel::<ClientEventOuter>();
+    let (client_sender, client_receiver) = mpsc::channel::<(Option<u8>, Sender<ServerEvent>)>();
     let (kill_sender, _kill_receiver) = mpsc::channel::<()>();
     thread::spawn(move || {
         for stream in listener.incoming() {
@@ -81,15 +75,11 @@ where
 
 /// Serves one connection: parse the HTTP request, then either upgrade it to a
 /// WebSocket or answer it as plain HTTP and hang up.
-fn handle_connection<Request, Response, Id>(
+fn handle_connection(
     mut stream: TcpStream,
-    request_sender: Sender<Request>,
-    client_sender: Sender<(Option<Id>, Sender<Response>)>,
-) where
-    Request: DeserializeOwned + Send + 'static,
-    Response: Serialize + Send + 'static,
-    Id: DeserializeOwned + Send + 'static,
-{
+    request_sender: Sender<ClientEventOuter>,
+    client_sender: Sender<(Option<u8>, Sender<ServerEvent>)>,
+) {
     let head = match read_http_head(&mut stream) {
         Ok(head) => head,
         Err(e) => {
@@ -152,13 +142,16 @@ fn handle_connection<Request, Response, Id>(
         }
     };
     // A well-behaved client waits for the 101 before sending frames, but if any
+
     // bytes did arrive alongside the head they belong to the WebSocket now.
     let mut reader = WebSocket::from_partially_read(stream, head.leftover, Role::Server, None);
     let mut writer = WebSocket::from_raw_socket(write_stream, Role::Server, None);
+    
+    let established_client_id: Arc<Mutex<Option<u8>>> = Arc::new(Mutex::new(None));
 
     // First frame after the upgrade identifies the client.
-    let client_id = match reader.read() {
-        Ok(Message::Text(txt)) => match serde_json::from_str::<Handshake<Id>>(&txt) {
+    let received_client_id = match reader.read() {
+        Ok(Message::Text(txt)) => match serde_json::from_str::<Handshake<u8>>(&txt) {
             Ok(req) => req.id,
             Err(e) => {
                 eprintln!("failed to deserialize handshake: {e}");
@@ -173,16 +166,27 @@ fn handle_connection<Request, Response, Id>(
         }
     };
 
+    if let Some(received_client_id) = received_client_id {
+        *established_client_id.lock().unwrap() = Some(received_client_id);
+    }
+
     // Per-connection response channel.
-    let (response_sender, response_receiver) = mpsc::channel::<Response>();
+    let (response_sender, response_receiver) = mpsc::channel::<ServerEvent>();
 
     // Reader thread: ws frame -> Request -> request_sender.
+    let established_client_id_1 = established_client_id.clone();
     thread::spawn(move || loop {
         match reader.read() {
-            Ok(Message::Text(txt)) => match serde_json::from_str::<Request>(&txt) {
+            Ok(Message::Text(txt)) => match serde_json::from_str::<ClientEvent>(&txt) {
                 Ok(req) => {
-                    if request_sender.send(req).is_err() {
-                        break;
+                    let established_client_id = established_client_id_1.lock().unwrap();
+                    match *established_client_id {
+                        Some(established_client_id) => {
+                            if request_sender.send(ClientEventOuter { client_id: established_client_id, client_event_inner: req }).is_err() {
+                                break;
+                            }
+                        },
+                        None => println!("Does not have cliet id to pass"),
                     }
                 }
                 Err(e) => eprintln!("failed to deserialize request: {e}"),
@@ -197,8 +201,16 @@ fn handle_connection<Request, Response, Id>(
     });
 
     // Writer thread: response_receiver -> Response -> ws frame.
+    let established_client_id_2 = established_client_id.clone();
     thread::spawn(move || {
         while let Ok(resp) = response_receiver.recv() {
+            match resp {
+                ServerEvent::ClientRegistered { client_id } => {
+                    let mut established_client_id = established_client_id_2.lock().unwrap();
+                    *established_client_id = Some(client_id);
+                },
+                _ => {},
+            }
             match serde_json::to_string(&resp) {
                 Ok(json) => {
                     if writer.send(Message::Text(json)).is_err() {
@@ -211,7 +223,7 @@ fn handle_connection<Request, Response, Id>(
     });
 
     // Hand the response sender to the consumer.
-    let _ = client_sender.send((client_id, response_sender));
+    let _ = client_sender.send((received_client_id, response_sender));
 }
 
 /// Responses for plain HTTP requests, i.e. everything that is not a WebSocket

@@ -4,7 +4,7 @@ use avian3d::{dynamics::integrator::IntegrationSystems::Velocity, prelude::*};
 use bevy::{ecs::{change_detection::Tick, system::SystemState}, prelude::*};
 
 use crate::{
-    app::{GameClientWrapper, screens::{app_state::AppState, lobby::PendingSpawns}}, server::{ClientEvent, Controller, GameEffect, OrderedF32, PlayerAction, ServerEvent},
+    app::{GameClientWrapper, screens::{app_state::AppState, lobby::PendingSpawns}}, server::{ClientEvent, Controller, GameEffect, GameState, OrderedF32, PlayerAction, PlayerBoomerangState, PlayerState, ServerEvent},
 };
 
 /// Identifies an entity as a player-controlled body.
@@ -101,30 +101,8 @@ pub struct Ticker(pub u64, pub bool);
 #[derive(Resource, Default)]
 pub struct InReplay(pub bool);
 
-#[derive(Clone)]
-pub enum PlayerBoomerangState {
-    Stationary,
-    Swinging{elapsed: f32},
-}
-
 #[derive(Resource, Default, Clone)]
 pub struct PlayerDirections(BTreeMap<u8, (std::time::SystemTime, Vec3)>);
-
-/// A snapshot of one locally-controlled player's physics at a given tick.
-#[derive(Clone)]
-pub struct PlayerState {
-    pub player_id: u8,
-    pub position: Vec3,
-    pub velocity: Vec3,
-    pub rotation: Quat,
-    pub acceleration: Vec3,
-    pub bommerang: Option<PlayerBoomerangState>,
-}
-
-#[derive(Clone)]
-pub struct GameState {
-    players: Vec<PlayerState>,
-}
 
 #[derive(Clone)]
 pub struct TickRecord {
