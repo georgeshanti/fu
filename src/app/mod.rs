@@ -25,6 +25,7 @@ pub fn run() {
         .add_plugins(PhysicsPlugins::default())
         .init_state::<AppState>()
         .init_resource::<SelectedController>()
+        .init_resource::<SelectedColor>()
         .add_systems(OnEnter(AppState::Menu), setup_menu)
         .add_systems(
             Update,
@@ -57,6 +58,7 @@ pub fn run() {
                 populate_controller_options,
                 toggle_controller_dropdown,
                 handle_controller_option_click,
+                handle_color_swatch_click,
                 update_join_button_state,
             )
                 .run_if(in_state(AppState::Lobby)),
@@ -91,5 +93,7 @@ pub fn run() {
             FixedUpdate,
             (drain_server_events).run_if(in_state(AppState::Playing))
         )
+        .add_systems(OnEnter(AppState::RoundEnded), setup_round_ended)
+        .add_systems(OnExit(AppState::RoundEnded), cleanup_round_ended)
         .run();
 }

@@ -10,6 +10,27 @@ use crate::{
     server::{ClientEvent, Controller, Player, ServerEvent},
 };
 
+/// The fixed palette a player picks from in the lobby. `SelectedColor` and
+/// `ColorSwatch` both carry an index into this array rather than a `Color`, so the
+/// palette can be reordered or extended in one place. Nothing consumes the chosen
+/// colour yet — it is only a join-time requirement.
+pub const PLAYER_COLORS: [(&str, Color); 8] = [
+    ("Red", Color::srgb(0.85, 0.20, 0.20)),
+    ("Orange", Color::srgb(0.92, 0.52, 0.15)),
+    ("Yellow", Color::srgb(0.93, 0.84, 0.22)),
+    ("Green", Color::srgb(0.25, 0.72, 0.30)),
+    ("Teal", Color::srgb(0.18, 0.70, 0.68)),
+    ("Blue", Color::srgb(0.22, 0.45, 0.88)),
+    ("Purple", Color::srgb(0.55, 0.32, 0.82)),
+    ("Pink", Color::srgb(0.90, 0.40, 0.70)),
+];
+
+/// Ring drawn around the chosen swatch.
+const SWATCH_RING_SELECTED: Color = Color::WHITE;
+/// …and around every other one: invisible, but it keeps all swatches the same
+/// size so the row doesn't reflow when the selection moves.
+const SWATCH_RING_UNSELECTED: Color = Color::NONE;
+
 /// Spawn assignments delivered by the server's `StartRound`, handed off to the
 /// `SpawningPlayers` state. Inserted by `update_lobby`; consumed by the spawning screen.
 #[derive(Resource)]
@@ -74,6 +95,21 @@ pub struct ControllerDropdownPanel;
 #[derive(Component)]
 pub struct ControllerOption(pub Controller);
 
+/// Index into `PLAYER_COLORS` of the colour the player picked, or `None` when
+/// nothing has been picked yet. Unlike `SelectedController` this is never
+/// auto-filled: picking a colour is required to join, so it is reset to `None`
+/// on every lobby entry and `handle_lobby_join_button` refuses to join without it.
+#[derive(Resource, Default)]
+pub struct SelectedColor(pub Option<usize>);
+
+/// A single colour swatch button; carries its index into `PLAYER_COLORS`.
+#[derive(Component)]
+pub struct ColorSwatch(pub usize);
+
+/// Marks the `Text` under the palette that names the current selection.
+#[derive(Component)]
+pub struct ColorSelectionText;
+
 /// Human-readable label for a controller, reused by the dropdown header and the
 /// player roster rows.
 fn controller_label(controller: Controller) -> String {
@@ -89,12 +125,16 @@ pub fn setup_lobby(
     mut commands: Commands,
     client: Res<GameClientWrapper>,
     mut selected: ResMut<SelectedController>,
+    mut selected_color: ResMut<SelectedColor>,
 ) {
     commands.spawn((Camera2d::default(), LobbyCamera));
 
     // Clear the selection; `populate_controller_options` picks the first
     // available input method on the next frame.
     selected.0 = None;
+
+    // Colours are never auto-picked — the player must choose one before joining.
+    selected_color.0 = None;
 
     commands
         .spawn((
@@ -189,6 +229,61 @@ pub fn setup_lobby(
                             ..default()
                         },
                         ControllerDropdownPanel,
+                    ));
+                });
+
+            // Colour picker: one swatch per `PLAYER_COLORS` entry. Nothing is
+            // preselected because a colour is required to join, so the label
+            // below reads as a prompt until a swatch is clicked.
+            parent
+                .spawn(Node {
+                    flex_direction: FlexDirection::Column,
+                    align_items: AlignItems::Center,
+                    row_gap: Val::Px(6.0),
+                    ..default()
+                })
+                .with_children(|picker| {
+                    picker
+                        .spawn(Node {
+                            flex_direction: FlexDirection::Row,
+                            justify_content: JustifyContent::Center,
+                            column_gap: Val::Px(8.0),
+                            ..default()
+                        })
+                        .with_children(|row| {
+                            for (index, (_, color)) in PLAYER_COLORS.iter().enumerate() {
+                                // The button itself is the selection ring and the
+                                // child square is the colour, so a swatch occupies
+                                // the same space selected or not.
+                                row.spawn((
+                                    Button,
+                                    Node {
+                                        width: Val::Px(46.0),
+                                        height: Val::Px(46.0),
+                                        justify_content: JustifyContent::Center,
+                                        align_items: AlignItems::Center,
+                                        ..default()
+                                    },
+                                    BackgroundColor(SWATCH_RING_UNSELECTED),
+                                    ColorSwatch(index),
+                                ))
+                                .with_children(|swatch| {
+                                    swatch.spawn((
+                                        Node {
+                                            width: Val::Px(34.0),
+                                            height: Val::Px(34.0),
+                                            ..default()
+                                        },
+                                        BackgroundColor(*color),
+                                    ));
+                                });
+                            }
+                        });
+
+                    picker.spawn((
+                        Text::new("Pick a colour"),
+                        TextColor(Color::WHITE),
+                        ColorSelectionText,
                     ));
                 });
 
@@ -456,11 +551,38 @@ pub fn handle_controller_option_click(
     }
 }
 
+/// Applies a clicked swatch: stores the index, moves the selection ring onto it,
+/// and updates the label under the palette.
+pub fn handle_color_swatch_click(
+    interactions: Query<(&Interaction, &ColorSwatch), Changed<Interaction>>,
+    mut selected_color: ResMut<SelectedColor>,
+    mut swatches: Query<(&ColorSwatch, &mut BackgroundColor)>,
+    mut label: Query<&mut Text, With<ColorSelectionText>>,
+) {
+    for (interaction, swatch) in &interactions {
+        if *interaction == Interaction::Pressed {
+            let picked = swatch.0;
+            selected_color.0 = Some(picked);
+            for (other, mut background) in &mut swatches {
+                background.0 = if other.0 == picked {
+                    SWATCH_RING_SELECTED
+                } else {
+                    SWATCH_RING_UNSELECTED
+                };
+            }
+            if let Ok(mut text) = label.single_mut() {
+                text.0 = format!("Colour: {}", PLAYER_COLORS[picked].0);
+            }
+        }
+    }
+}
+
 /// Emits a `JoinLobby` event with the typed name when the "Join" button is pressed.
 pub fn handle_lobby_join_button(
     interactions: Query<&Interaction, (Changed<Interaction>, With<LobbyJoinButton>)>,
     name_field: Query<&InputField, With<LobbyNameField>>,
     selected: Res<SelectedController>,
+    selected_color: Res<SelectedColor>,
     client: Res<GameClientWrapper>,
 ) {
     for interaction in &interactions {
@@ -475,6 +597,10 @@ pub fn handle_lobby_join_button(
             let Some(controller) = selected.0 else {
                 continue; // no input method available to join with
             };
+            // The colour itself isn't sent yet, but picking one is required.
+            if selected_color.0.is_none() {
+                continue;
+            }
             let client_guard = client.client.read().unwrap();
             let Some(client_id) = *client_guard.client_id.read().unwrap() else {
                 continue; // not registered yet
@@ -501,18 +627,20 @@ pub fn handle_lobby_start_button(
     }
 }
 
-/// Dims the "Join" button while no input method is available, so it reads as
-/// disabled. Gated on `SelectedController` change-detection, since availability
-/// only changes when `populate_controller_options` re-points the selection.
+/// Dims the "Join" button until both an input method and a colour are chosen, so
+/// it reads as disabled. Gated on change-detection of the two selection
+/// resources, which only change when `populate_controller_options` re-points the
+/// controller or a swatch is clicked.
 pub fn update_join_button_state(
     selected: Res<SelectedController>,
+    selected_color: Res<SelectedColor>,
     mut button: Query<&mut BackgroundColor, With<LobbyJoinButton>>,
 ) {
-    if !selected.is_changed() {
+    if !selected.is_changed() && !selected_color.is_changed() {
         return;
     }
     if let Ok(mut bg) = button.single_mut() {
-        bg.0 = if selected.0.is_some() {
+        bg.0 = if selected.0.is_some() && selected_color.0.is_some() {
             Color::srgb(0.2, 0.2, 0.25)
         } else {
             Color::srgb(0.1, 0.1, 0.1)

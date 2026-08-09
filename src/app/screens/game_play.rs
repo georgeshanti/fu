@@ -2,6 +2,7 @@ use std::{backtrace::Backtrace, collections::{BTreeMap, BTreeSet}};
 
 use avian3d::{dynamics::integrator::IntegrationSystems::Velocity, prelude::*};
 use bevy::{ecs::{change_detection::Tick, system::SystemState}, prelude::*};
+use tungstenite::handshake::server;
 
 use crate::{
     app::{GameClientWrapper, screens::{app_state::AppState, lobby::PendingSpawns}}, server::{ClientEvent, Controller, GameEffect, GameState, OrderedF32, PlayerAction, PlayerBoomerangState, PlayerState, ServerEvent},
@@ -182,6 +183,10 @@ pub struct CountdownOverlay;
 /// The big number `Text` inside the overlay.
 #[derive(Component)]
 pub struct CountdownText;
+
+/// Root node of the round-ended overlay (despawned on `OnExit(AppState::RoundEnded)`).
+#[derive(Component)]
+pub struct RoundEndedOverlay;
 
 /// Constant linear acceleration applied to the player to overcome ground friction.
 /// Derived from Coulomb friction: μ × g = 0.5 × 9.81 = 4.905 m/s²
@@ -370,6 +375,61 @@ pub fn wait_for_start(
     }
 }
 
+/// Puts the round-ended overlay up on `OnEnter(AppState::RoundEnded)`.
+///
+/// The 3D scene is deliberately left standing: every `AppState::Playing` system
+/// (movement, swings, strike detection, event draining) stops running on the state
+/// change, so the field simply freezes as it was and this dimmed UI layer draws on
+/// top of it — same trick as the pre-game countdown overlay.
+pub fn setup_round_ended(mut commands: Commands, survivors: Query<&Player, Without<Dead>>) {
+    // The server ends the round as soon as at most one player is still alive, so a
+    // lone survivor is the winner; anything else (a same-tick double KO, or a round
+    // ended some other way) is reported as a draw.
+    let heading = match survivors.iter().collect::<Vec<_>>().as_slice() {
+        [winner] => format!("Player {} wins", winner.player_id),
+        _ => "Draw".to_string(),
+    };
+
+    // Full-screen dimmed overlay with the result centered on it.
+    commands
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                width: Val::Percent(100.0),
+                height: Val::Percent(100.0),
+                flex_direction: FlexDirection::Column,
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                row_gap: Val::Px(16.0),
+                ..default()
+            },
+            BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.5)),
+            RoundEndedOverlay,
+        ))
+        .with_children(|parent| {
+            parent.spawn((
+                Text::new("Round Over"),
+                TextFont { font_size: 80.0, ..default() },
+                TextColor(Color::WHITE),
+            ));
+            parent.spawn((
+                Text::new(heading),
+                TextFont { font_size: 40.0, ..default() },
+                TextColor(Color::srgb(0.8, 0.8, 0.8)),
+            ));
+        });
+}
+
+/// Despawns the round-ended overlay on `OnExit(AppState::RoundEnded)`.
+pub fn cleanup_round_ended(
+    mut commands: Commands,
+    overlay: Query<Entity, With<RoundEndedOverlay>>,
+) {
+    for entity in &overlay {
+        commands.entity(entity).despawn();
+    }
+}
+
 pub fn drain_server_events(
     world: &mut World,
     // The queries and resources this system used to take as individual params are
@@ -388,10 +448,11 @@ pub fn drain_server_events(
         ResMut<Assets<Mesh>>,
         ResMut<Assets<StandardMaterial>>,
         ResMut<InReplay>,
+        ResMut<NextState<AppState>>,
     )>>,
 ) {
     // println!("Draining");
-    let mut new_player_actions = {
+    let (mut new_player_actions, server_events) = {
         let client = params.get_mut(world).1;
         let client = client.client.read().unwrap();
         let events = {
@@ -400,10 +461,22 @@ pub fn drain_server_events(
             *server_events = vec![];
             events
         };
-        let mut game_events: Vec<(u64, PlayerAction)> = events.iter().filter_map(|event| { if let ServerEvent::PlayerAction{tick: tick, game_event: game_event} = event { Some((*tick, game_event.clone())) } else { None } }).collect();
-        game_events.sort_by(|a, b| {a.0.cmp(&b.0)});
-        game_events
+        let mut player_actions: Vec<(u64, PlayerAction)> = events.iter().filter_map(|event| { if let ServerEvent::PlayerAction{tick: tick, game_event: game_event} = event { Some((*tick, game_event.clone())) } else { None } }).collect();
+        player_actions.sort_by(|a, b| {a.0.cmp(&b.0)});
+        (player_actions, events)
     };
+    for server_event in server_events {
+        match server_event {
+            ServerEvent::RoundEnded => {
+                // Leave the scene standing and hand over to `setup_round_ended`, which
+                // draws the result overlay on top of the now-frozen field.
+                let (_, _, _, _, _, _, _, _, _, _, _, mut next_state) = params.get_mut(world);
+                next_state.set(AppState::RoundEnded);
+                return;
+            },
+            _ => {}
+        }
+    }
     if !new_player_actions.is_empty() {
         let final_tick = {
             let ticker = params.get_mut(world).5;
@@ -412,7 +485,7 @@ pub fn drain_server_events(
         let mut existing_records = {
             println!("Stuff: {}", new_player_actions.first().unwrap().0);
             let first_tick = new_player_actions.first().unwrap().0;
-            let (mut commands, _, _, _, _, mut ticker, mut local_game_events, players, mut meshes, mut materials, mut in_replay) = params.get_mut(world);
+            let (mut commands, _, _, _, _, mut ticker, mut local_game_events, players, mut meshes, mut materials, mut in_replay, _) = params.get_mut(world);
             println!("first tick value: {}", local_game_events.game_events.first().unwrap().tick);
             let game_state = local_game_events.game_events.get(first_tick as usize).unwrap().game_state.clone();
             spawn_world(&mut commands, &mut materials, &mut meshes, players, game_state);
@@ -429,7 +502,7 @@ pub fn drain_server_events(
         // despawn finally landed.
         params.apply(world);
         let mut current_tick = {
-            let (_, _, _, _, _, ticker, _, players, mut meshes, mut materials, mut in_replay) = params.get_mut(world);
+            let (_, _, _, _, _, ticker, _, players, mut meshes, mut materials, mut in_replay, _) = params.get_mut(world);
             ticker.0
         };
         println!("current_tick: {}, final_tick: {}", current_tick, final_tick);
@@ -439,7 +512,7 @@ pub fn drain_server_events(
                     println!("New player action: {:?} {:?}", new_player_actions.first().unwrap().0, new_player_actions.first().unwrap().1.clone());
                 }
                 while !new_player_actions.is_empty() && new_player_actions.first().unwrap().0 == current_tick {
-                    let (mut commands, client, mut query, swing_targets, lobjects, mut ticker, mut sent_events, _, _, _, _) =
+                    let (mut commands, client, mut query, swing_targets, lobjects, mut ticker, mut sent_events, _, _, _, _, _) =
                         params.get_mut(world);
                     let first = new_player_actions.first().unwrap();
                     {
@@ -488,7 +561,7 @@ pub fn drain_server_events(
                 {
                     if !existing_records.is_empty() {
                         for player_action in existing_records.first().unwrap().player_actions.iter() {
-                            let (mut commands, client, mut query, swing_targets, lobjects, mut ticker, mut sent_events, _, _, _, _) =
+                            let (mut commands, client, mut query, swing_targets, lobjects, mut ticker, mut sent_events, _, _, _, _, _) =
                                 params.get_mut(world);
                             match player_action {
                                 PlayerAction::Movement { player_id, x, y } => {
@@ -539,7 +612,7 @@ pub fn drain_server_events(
             params.apply(world);
             println!("Ran scehdule");
             if !existing_records.is_empty() {
-                let (_, client, _, _, _, _, mut local_game_events, _, _, _, _) = params.get_mut(world);
+                let (_, client, _, _, _, _, mut local_game_events, _, _, _, _, _) = params.get_mut(world);
                 let old_game_effects = existing_records.first().unwrap().game_effects.clone();
                 let new_game_effects = local_game_events.game_events.get(current_tick as usize).unwrap().game_effects.clone();
                 let missing_game_effects = new_game_effects.difference(&old_game_effects);
@@ -551,12 +624,12 @@ pub fn drain_server_events(
                 existing_records.remove(0);
             }
             current_tick = {
-                let (_, _, _, _, _, ticker, _, _, _, _, _) = params.get_mut(world);
+                let (_, _, _, _, _, ticker, _, _, _, _, _, _) = params.get_mut(world);
                 ticker.0
             };
         }
         {
-            let (_, _, _, _, _, _, _, _, _, _, mut in_replay) = params.get_mut(world);
+            let (_, _, _, _, _, _, _, _, _, _, mut in_replay, _) = params.get_mut(world);
             in_replay.0 = false;
         }
         {
