@@ -120,6 +120,7 @@ pub enum PlayerBoomerangState {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PlayerState {
     pub player_id: u8,
+    pub color: Color,
     pub position: Vec3,
     pub velocity: Vec3,
     pub rotation: Quat,
@@ -147,7 +148,7 @@ pub enum ServerEvent {
     GameEffect {tick: u64, game_event: GameEffect},
     GameStateRequest,
     OverrideGameState {tick: u64, game_state: GameState},
-    RoundEnded,
+    RoundEnded{ max: u8, old_score: BTreeMap<u8, u8>, new_score: BTreeMap<u8, u8> },
 }
 
 #[derive(Event, Debug, Clone, Serialize, Deserialize)]
@@ -156,11 +157,18 @@ pub struct ClientEventOuter {
     pub client_event_inner: ClientEvent,
 }
 
+#[derive(Debug, Copy, Clone, Serialize, Deserialize)]
+pub struct Color {
+    pub red: u8,
+    pub green: u8,
+    pub blue: u8,
+}
+
 /// Events originating from a client, sent to the server.
-#[derive(Event, Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ClientEvent {
     /// Registers a player with the given name and chosen input controller.
-    JoinLobby { client_id: u8, name: String, controller: Controller },
+    JoinLobby { client_id: u8, name: String, controller: Controller, color: Color },
     /// Asks the server to reply with the current lobby roster (`LobbyInfo`).
     FetchLobby,
     /// Asks the server to begin the round (sent from the lobby "Start Game" button).
@@ -193,6 +201,12 @@ pub enum Controller {
     Gamepad(u32),
 }
 
+#[derive(Ord, PartialEq, PartialOrd, Eq)]
+struct PlayerDeathEvent {
+    dead_player_id: u8,
+    score_player_id: u8,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Player {
     pub id: u8,
@@ -200,6 +214,7 @@ pub struct Player {
     pub name: String,
     pub controller: Controller,
     pub alive: bool,
+    pub color: Color,
 }
 
 /// Server-side hub: maintains game state
@@ -217,10 +232,12 @@ pub struct GameServer {
     pub game_effects: Arc<Mutex<BTreeMap<u64, BTreeMap<GameEffect, BTreeSet<u8>>>>>,
     pub latest_tick_received: Arc<Mutex<Option<(u8, u64)>>>,
     pub clients_to_override: Arc<Mutex<Vec<u8>>>,
-    pub player_death_events: Arc<Mutex<BTreeMap<u64, BTreeMap<u8, BTreeSet<u8>>>>>,
+    pub player_death_events: Arc<Mutex<BTreeMap<u64, BTreeMap<PlayerDeathEvent, BTreeSet<u8>>>>>,
     pub active_clients_buffer: Arc<Mutex<BTreeSet<u8>>>,
     pub active_clients: Arc<Mutex<BTreeSet<u8>>>,
     pub alive_players: Arc<Mutex<BTreeSet<u8>>>,
+    pub old_player_scores: Arc<Mutex<BTreeMap<u8, u8>>>,
+    pub player_scores: Arc<Mutex<BTreeMap<u8, u8>>>,
 }
 
 trait MultipleSenders<T> {
@@ -251,6 +268,8 @@ impl GameServer {
             active_clients_buffer: Arc::new(Mutex::new(BTreeSet::new())),
             active_clients: Arc::new(Mutex::new(BTreeSet::new())),
             alive_players: Arc::new(Mutex::new(BTreeSet::new())),
+            old_player_scores: Arc::new(Mutex::new(BTreeMap::new())),
+            player_scores: Arc::new(Mutex::new(BTreeMap::new())),
         };
         (server, sender)
     }
@@ -275,25 +294,33 @@ impl GameServer {
         let active_clients = self.active_clients.clone();
         let alive_players = self.alive_players.clone();
         let clients = self.clients.clone();
+        let player_scores = self.player_scores.clone();
+        let old_scores = self.old_player_scores.clone();
         thread::spawn(move || {
             loop {
                 sleep(Duration::from_millis(250));
                 let mut player_death_events = player_death_events.lock().unwrap();
                 let mut ticks_to_remove: Vec<u64> = vec![];
-                let mut alive_player_change = false;
+                let mut alive_player_change = true;
                 for player_death_event in player_death_events.iter() {
                     let mut acknowledge_dead_players_at_tick = true;
-                    for dead_player in player_death_event.1.iter() {
+                    for player_death_event in player_death_event.1.iter() {
                         let active_clients = active_clients.lock().unwrap();
-                        if !active_clients.is_subset(dead_player.1) {
+                        if !active_clients.is_subset(player_death_event.1) {
                             acknowledge_dead_players_at_tick = false;
                         }
                     }
                     if acknowledge_dead_players_at_tick {
                         // alive_player_change = true;
                         let mut alive_players = alive_players.lock().unwrap();
-                        for dead_player in player_death_event.1.iter() {
-                            alive_players.remove(dead_player.0);
+                        let mut player_scores = player_scores.lock().unwrap();
+                        for player_death_event in player_death_event.1.iter() {
+                            alive_players.remove(&player_death_event.0.dead_player_id);
+                            let player_score = {
+                                let mut player_score = player_scores.get(&player_death_event.0.score_player_id);
+                                **player_score.get_or_insert(&0)
+                            };
+                            player_scores.insert(player_death_event.0.score_player_id, player_score+1);
                         }
                         ticks_to_remove.push(*player_death_event.0);
                     } else {
@@ -303,15 +330,15 @@ impl GameServer {
                 for tick_to_remove in ticks_to_remove {
                     player_death_events.remove(&tick_to_remove);
                 }
-                // if alive_player_change {
+                if alive_player_change {
                     let alive_players = alive_players.lock().unwrap();
                     if alive_players.len() <=1 {
                         senders.send(());
                         for client in clients.lock().unwrap().1.iter() {
-                            let _ = client.1.send(ServerEvent::RoundEnded);
+                            let _ = client.1.send(ServerEvent::RoundEnded{ max: 20, old_score: old_scores.lock().unwrap().clone(), new_score: player_scores.lock().unwrap().clone()});
                         }
                     }
-                // }
+                }
             }
         });
     }
@@ -358,12 +385,12 @@ impl GameServer {
                 println!("Got client event: {:?}", event);
                 let mut phase = phase.lock().unwrap();
                 match event.client_event_inner {
-                    ClientEvent::JoinLobby { client_id, name, controller } => {
+                    ClientEvent::JoinLobby { client_id, name, controller, color } => {
                         if *phase != GamePhase::Lobby { continue };
                         let roster = {
                             let mut players = players.lock().unwrap();
                             let id = players.len() as u8;
-                            players.push(Player { id, client_id, name, controller, alive: true });
+                            players.push(Player { id, client_id, name, controller, alive: true, color });
                             players.clone()
                         };
                         for client in clients_guard.1.values() {
@@ -379,9 +406,13 @@ impl GameServer {
                     }
                     ClientEvent::StartGame => {
                         if *phase != GamePhase::Lobby { continue };
+                        let players = players.lock().unwrap();
+                        // if players.len() <= 1 {
+                        //     continue;
+                        // }
                         *phase = GamePhase::RoundStarting;
                         pending_client_starts.lock().unwrap().clear();
-                        let roster = players.lock().unwrap().clone();
+                        let roster = players.clone();
                         let n = roster.len();
                         let spawns: Vec<(Player, Vec3)> = roster
                             .into_iter()
@@ -475,10 +506,10 @@ impl GameServer {
                                     if !player_death_events.contains_key(&tick) {
                                         player_death_events.insert(tick, BTreeMap::new());
                                     }
-                                    if !player_death_events.get(&tick).unwrap().contains_key(&struck_id) {
-                                        player_death_events.get_mut(&tick).unwrap().insert(struck_id, BTreeSet::new());
+                                    if !player_death_events.get(&tick).unwrap().contains_key(&PlayerDeathEvent { dead_player_id: struck_id, score_player_id: striker_id }) {
+                                        player_death_events.get_mut(&tick).unwrap().insert(PlayerDeathEvent { dead_player_id: struck_id, score_player_id: striker_id }, BTreeSet::new());
                                     }
-                                    player_death_events.get_mut(&tick).unwrap().get_mut(&struck_id).unwrap().insert(event.client_id);
+                                    player_death_events.get_mut(&tick).unwrap().get_mut(&PlayerDeathEvent { dead_player_id: struck_id, score_player_id: striker_id }).unwrap().insert(event.client_id);
                                 }
                                 for client in clients_guard.1.values() {
                                     let _ = client.send(ServerEvent::GameEffect {tick, game_event: GameEffect::StrikePlayer { struck_id, striker_id }});

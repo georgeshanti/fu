@@ -5,9 +5,7 @@ use crate::{
         GameClientWrapper,
         common::text::{InputField, InputText, TextInputFocused},
         screens::app_state::AppState,
-    },
-    client::ClientPlayer,
-    server::{ClientEvent, Controller, Player, ServerEvent},
+    }, client::ClientPlayer, server::{self, ClientEvent, Controller, Player, ServerEvent},
 };
 
 /// The fixed palette a player picks from in the lobby. `SelectedColor` and
@@ -606,7 +604,13 @@ pub fn handle_lobby_join_button(
                 continue; // not registered yet
             };
             if let Some(sender) = &client_guard.sender {
-                sender.send(ClientEvent::JoinLobby { client_id, name: name.to_string(), controller }).ok();
+                let color = selected_color.0.unwrap();
+                let color = server::Color {
+                    red: (PLAYER_COLORS[color].1.to_srgba().red*256.0) as u8,
+                    green: (PLAYER_COLORS[color].1.to_srgba().green*256.0) as u8,
+                    blue: (PLAYER_COLORS[color].1.to_srgba().blue*256.0) as u8,
+                };
+                sender.send(ClientEvent::JoinLobby { client_id, name: name.to_string(), controller, color }).ok();
             }
         }
     }

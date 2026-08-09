@@ -2,16 +2,22 @@ use std::{backtrace::Backtrace, collections::{BTreeMap, BTreeSet}};
 
 use avian3d::{dynamics::integrator::IntegrationSystems::Velocity, prelude::*};
 use bevy::{ecs::{change_detection::Tick, system::SystemState}, prelude::*};
-use tungstenite::handshake::server;
 
 use crate::{
-    app::{GameClientWrapper, screens::{app_state::AppState, lobby::PendingSpawns}}, server::{ClientEvent, Controller, GameEffect, GameState, OrderedF32, PlayerAction, PlayerBoomerangState, PlayerState, ServerEvent},
+    app::{GameClientWrapper, screens::{app_state::AppState, lobby::PendingSpawns}}, server::{self, ClientEvent, Controller, GameEffect, GameState, OrderedF32, PlayerAction, PlayerBoomerangState, PlayerState, ServerEvent},
 };
 
 /// Identifies an entity as a player-controlled body.
 #[derive(Component)]
-pub struct Player {
+pub struct PlayerId {
     pub player_id: u8,
+    pub color: server::Color,
+}
+
+struct PlayerInfo {
+    pub player_id: u8,
+    pub color: server::Color,
+    pub name: String,
 }
 
 /// An L-shaped object held off a player's right side. Spawned as a child of the
@@ -105,6 +111,9 @@ pub struct InReplay(pub bool);
 #[derive(Resource, Default, Clone)]
 pub struct PlayerDirections(BTreeMap<u8, (std::time::SystemTime, Vec3)>);
 
+#[derive(Resource, Default)]
+pub struct PlayerInfos(pub Vec<PlayerInfo>);
+
 #[derive(Clone)]
 pub struct TickRecord {
     pub tick: u64,
@@ -188,6 +197,13 @@ pub struct CountdownText;
 #[derive(Component)]
 pub struct RoundEndedOverlay;
 
+#[derive(Resource)]
+pub struct Score{
+    max: u8,
+    old_score: BTreeMap<u8, u8>,
+    new_score: BTreeMap<u8, u8>,
+}
+
 /// Constant linear acceleration applied to the player to overcome ground friction.
 /// Derived from Coulomb friction: μ × g = 0.5 × 9.81 = 4.905 m/s²
 const PLAYER_ACCEL: f32 = 4.905;
@@ -239,11 +255,12 @@ pub fn setup_game_play(
         let l_foot_mesh = meshes.add(Cuboid::new(0.2, 0.1, 0.8));
         let l_material = materials.add(Color::srgb(0.7, 0.7, 0.7));
 
+
         for (player, position) in &spawns.0 {
             commands
                 .spawn((
                     Mesh3d(meshes.add(Cylinder::new(0.5, 1.0))),
-                    MeshMaterial3d(materials.add(Color::srgb(0.8, 0.3, 0.3))),
+                MeshMaterial3d(materials.add(Color::srgb(player.color.red as f32 / 256.0, player.color.green as f32 / 256.0, player.color.blue as f32 / 256.0))),
                     Transform::from_translation(*position),
                     RigidBody::Dynamic,
                     Collider::cylinder(0.5, 1.0),
@@ -251,7 +268,7 @@ pub fn setup_game_play(
                     // rotation so collisions don't tumble the cube and fight that facing.
                     LockedAxes::ROTATION_LOCKED,
                     ConstantLinearAcceleration(Vec3::ZERO),
-                    Player { player_id: player.id },
+                    PlayerId { player_id: player.id, color: player.color },
                 ))
                 .with_children(|parent| {
                     // The L as a single entity, anchored at the point where it meets the
@@ -286,6 +303,7 @@ pub fn setup_game_play(
                         });
                 });
         }
+        commands.insert_resource(PlayerInfos(spawns.0.iter().map(|player| { PlayerInfo { player_id: player.0.id, color: player.0.color, name: player.0.name.clone()} }).collect()));
     }
 
     // Start the pre-game countdown; `PlayersSpawned` is sent once it elapses.
@@ -381,14 +399,10 @@ pub fn wait_for_start(
 /// (movement, swings, strike detection, event draining) stops running on the state
 /// change, so the field simply freezes as it was and this dimmed UI layer draws on
 /// top of it — same trick as the pre-game countdown overlay.
-pub fn setup_round_ended(mut commands: Commands, survivors: Query<&Player, Without<Dead>>) {
+pub fn setup_round_ended(mut commands: Commands, score: Option<Res<Score>>, player_infos: Res<PlayerInfos>) {
     // The server ends the round as soon as at most one player is still alive, so a
     // lone survivor is the winner; anything else (a same-tick double KO, or a round
     // ended some other way) is reported as a draw.
-    let heading = match survivors.iter().collect::<Vec<_>>().as_slice() {
-        [winner] => format!("Player {} wins", winner.player_id),
-        _ => "Draw".to_string(),
-    };
 
     // Full-screen dimmed overlay with the result centered on it.
     commands
@@ -413,7 +427,7 @@ pub fn setup_round_ended(mut commands: Commands, survivors: Query<&Player, Witho
                 TextColor(Color::WHITE),
             ));
             parent.spawn((
-                Text::new(heading),
+                Text::new("ROUND"),
                 TextFont { font_size: 40.0, ..default() },
                 TextColor(Color::srgb(0.8, 0.8, 0.8)),
             ));
@@ -439,12 +453,12 @@ pub fn drain_server_events(
     mut params: Local<SystemState<(
         Commands,
         Res<GameClientWrapper>,
-        Query<(Entity, &Player, &mut LinearVelocity, &mut ConstantLinearAcceleration, &mut Rotation, &mut Transform), Without<Dead>>,
-        Query<(&Player, &Children), Without<Dead>>,
+        Query<(Entity, &PlayerId, &mut LinearVelocity, &mut ConstantLinearAcceleration, &mut Rotation, &mut Transform), Without<Dead>>,
+        Query<(&PlayerId, &Children), Without<Dead>>,
         Query<Entity, (With<Boomerang>, Without<Swinging>)>,
         ResMut<Ticker>,
         ResMut<LocalGameEvents>,
-        Query<Entity, With<Player>>,
+        Query<Entity, With<PlayerId>>,
         ResMut<Assets<Mesh>>,
         ResMut<Assets<StandardMaterial>>,
         ResMut<InReplay>,
@@ -467,10 +481,11 @@ pub fn drain_server_events(
     };
     for server_event in server_events {
         match server_event {
-            ServerEvent::RoundEnded => {
+            ServerEvent::RoundEnded{ max, old_score, new_score} => {
                 // Leave the scene standing and hand over to `setup_round_ended`, which
                 // draws the result overlay on top of the now-frozen field.
-                let (_, _, _, _, _, _, _, _, _, _, _, mut next_state) = params.get_mut(world);
+                let (mut commands, _, _, _, _, _, _, _, _, _, _, mut next_state) = params.get_mut(world);
+                commands.insert_resource(Score{max, old_score, new_score});
                 next_state.set(AppState::RoundEnded);
                 return;
             },
@@ -657,7 +672,7 @@ pub fn move_player(
     time: Res<Time>,
     ticker: Res<Ticker>,
     mut sent_events: ResMut<LocalGameEvents>,
-    mut query: Query<(&mut Player, &Transform, &LinearVelocity, &Rotation, &ConstantLinearAcceleration), Without<Dead>>,
+    mut query: Query<(&mut PlayerId, &Transform, &LinearVelocity, &Rotation, &ConstantLinearAcceleration), Without<Dead>>,
     mut player_directions: ResMut<PlayerDirections>,
 ) {
 
@@ -738,7 +753,7 @@ pub fn start_swing(
     client: Res<GameClientWrapper>,
     ticker: Res<Ticker>,
     mut sent_events: ResMut<LocalGameEvents>,
-    players: Query<(&Player, &Children), Without<SwingCooldown>>,
+    players: Query<(&PlayerId, &Children), Without<SwingCooldown>>,
     lobjects: Query<(), (With<Boomerang>, Without<Swinging>)>,
 ) {
     let roster: Vec<(u8, Controller)> = {
@@ -824,12 +839,12 @@ pub fn detect_strikes(
     mut collisions: MessageReader<CollisionStart>,
     in_replay: Res<InReplay>,
     client: Res<GameClientWrapper>,
-    players: Query<&Player>,
+    players: Query<&PlayerId>,
     blades: Query<&ChildOf, With<BoomerangBlade>>,
     swinging: Query<(), With<Swinging>>,
     ticker: Res<Ticker>,
     mut sent_events: ResMut<LocalGameEvents>,
-    state_query: Query<(&Player, &Transform, &LinearVelocity, &Rotation)>,
+    state_query: Query<(&PlayerId, &Transform, &LinearVelocity, &Rotation)>,
 ) {
     // Snapshot which player ids this client controls locally.
     let local_ids: Vec<u8> = {
@@ -914,7 +929,7 @@ pub fn animate_death(time: Res<Time>, mut query: Query<(&mut Transform, &mut Dea
 pub fn record_tick_state(
     mut ticker: ResMut<Ticker>,
     mut sent_events: ResMut<LocalGameEvents>,
-    player_query: Query<(&Player, &Transform, &LinearVelocity, &Rotation, &ConstantLinearAcceleration, &Children)>,
+    player_query: Query<(&PlayerId, &Transform, &LinearVelocity, &Rotation, &ConstantLinearAcceleration, &Children)>,
     stationary_boomerangs: Query<&Boomerang, Without<Swinging>>,
     swinging_boomerangs: Query<(&Boomerang, &Swinging), With<Swinging>>,
 ) {
@@ -942,6 +957,7 @@ pub fn record_tick_state(
             println!("Tick: {}, Recording: {:?}", ticker.0, transform.translation);
             PlayerState {
                 player_id: player.player_id,
+                color: player.color,
                 position: transform.translation,
                 velocity: velocity.0,
                 rotation: rotation.0,
@@ -996,7 +1012,7 @@ pub fn record_game_effect(
     }
 }
 
-pub fn spawn_world(commands: &mut Commands, materials: &mut ResMut<Assets<StandardMaterial>>, meshes: &mut ResMut<Assets<Mesh>>, players: Query<Entity, With<Player>>, game_state: GameState) {
+pub fn spawn_world(commands: &mut Commands, materials: &mut ResMut<Assets<StandardMaterial>>, meshes: &mut ResMut<Assets<Mesh>>, players: Query<Entity, With<PlayerId>>, game_state: GameState) {
     for player in players {
         commands.entity(player).despawn();
     }
@@ -1007,7 +1023,7 @@ pub fn spawn_world(commands: &mut Commands, materials: &mut ResMut<Assets<Standa
         commands
             .spawn((
                 Mesh3d(meshes.add(Cylinder::new(0.5, 1.0))),
-                MeshMaterial3d(materials.add(Color::srgb(0.8, 0.3, 0.3))),
+                MeshMaterial3d(materials.add(Color::srgb(player.color.red as f32 / 256.0, player.color.green as f32 / 256.0, player.color.blue as f32 / 256.0))),
                 // NB: `.rotate()` mutates and returns `()` (which is a valid empty Bundle,
                 // so it compiles but silently inserts no Transform at all) — the builder
                 // form `.with_rotation()` is required here.
@@ -1019,7 +1035,7 @@ pub fn spawn_world(commands: &mut Commands, materials: &mut ResMut<Assets<Standa
                 LockedAxes::ROTATION_LOCKED,
                 ConstantLinearAcceleration(player.acceleration),
                 LinearVelocity(player.velocity),
-                Player { player_id: player.player_id },
+                PlayerId { player_id: player.player_id, color: player.color },
             ))
             .with_children(|parent| {
                 // The L as a single entity, anchored at the point where it meets the
