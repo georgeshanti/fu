@@ -116,9 +116,17 @@ pub enum PlayerBoomerangState {
     Swinging{elapsed: f32},
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum PlayerStatus {
+    Alive,
+    Dying { elapsed: f32 },
+    Dead,
+}
+
 /// A snapshot of one locally-controlled player's physics at a given tick.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PlayerState {
+    pub status: PlayerStatus,
     pub player_id: u8,
     pub color: Color,
     pub position: Vec3,
@@ -185,14 +193,15 @@ pub enum ClientEvent {
 #[derive(Event, Debug, Clone, Serialize, Deserialize, PartialEq, PartialOrd, Eq, Ord)]
 pub enum PlayerAction {
     Movement { player_id: u8, x: OrderedF32, y: OrderedF32 },
-    /// A player pressed their swing input; starts a boomerang swing for that player.
     Swing { player_id: u8 },
+    Jump { player_id: u8, x: OrderedF32, y: OrderedF32  },
 }
 
 #[derive(Event, Debug, Clone, Serialize, Deserialize, PartialEq, PartialOrd, Eq, Ord)]
 pub enum GameEffect {
     /// A striker's boomerang hit another player; carries both player ids.
     StrikePlayer { striker_id: u8, struck_id: u8 },
+    Parry { player_1_id: u8, player_2_id: u8 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -301,7 +310,7 @@ impl GameServer {
                 sleep(Duration::from_millis(250));
                 let mut player_death_events = player_death_events.lock().unwrap();
                 let mut ticks_to_remove: Vec<u64> = vec![];
-                let mut alive_player_change = true;
+                let mut alive_player_change = false;
                 for player_death_event in player_death_events.iter() {
                     let mut acknowledge_dead_players_at_tick = true;
                     for player_death_event in player_death_event.1.iter() {
@@ -311,7 +320,7 @@ impl GameServer {
                         }
                     }
                     if acknowledge_dead_players_at_tick {
-                        // alive_player_change = true;
+                        alive_player_change = true;
                         let mut alive_players = alive_players.lock().unwrap();
                         let mut player_scores = player_scores.lock().unwrap();
                         for player_death_event in player_death_event.1.iter() {
@@ -382,7 +391,6 @@ impl GameServer {
             loop {
                 let event = receiver.recv().unwrap();
                 let clients_guard = clients.lock().unwrap();
-                println!("Got client event: {:?}", event);
                 let mut phase = phase.lock().unwrap();
                 match event.client_event_inner {
                     ClientEvent::JoinLobby { client_id, name, controller, color } => {
@@ -475,17 +483,8 @@ impl GameServer {
                         std::thread::spawn(move || {
                             // sleep(Duration::from_millis(50));
                             let clients = clients.lock().unwrap();
-                            match game_event {
-                                PlayerAction::Movement{player_id, x, y} => {
-                                    for client in clients.1.values() {
-                                        let _ = client.send(ServerEvent::PlayerAction { tick, game_event: PlayerAction::Movement { player_id, x, y }});
-                                    }
-                                }
-                                PlayerAction::Swing { player_id } => {
-                                    for client in clients.1.values() {
-                                        let _ = client.send(ServerEvent::PlayerAction { tick, game_event: PlayerAction::Swing { player_id }});
-                                    }
-                                }
+                            for client in clients.1.values() {
+                                let _ = client.send(ServerEvent::PlayerAction { tick, game_event: game_event.clone() });
                             }
                         });
                     }
@@ -514,6 +513,9 @@ impl GameServer {
                                 for client in clients_guard.1.values() {
                                     let _ = client.send(ServerEvent::GameEffect {tick, game_event: GameEffect::StrikePlayer { struck_id, striker_id }});
                                 }
+                            },
+                            GameEffect::Parry { player_1_id, player_2_id } => {
+                                
                             }
                         }
                     }

@@ -10,5 +10,6 @@ pub enum AppState {
     Lobby,
     SpawningPlayers,
     Playing,
+    RoundEndAnimation,
     RoundEnded,
 }

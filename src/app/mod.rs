@@ -72,9 +72,9 @@ pub fn run() {
         .add_systems(
             Update,
             (
+                start_jump,
                 start_swing,
                 move_player,
-                tick_swing_cooldown,
                 apply_dead_collision_layers,
                 animate_death,
             )
@@ -83,6 +83,7 @@ pub fn run() {
         .add_systems(
             PhysicsSchedule,
             (
+                detect_parries.before(animate_swing),
                 animate_swing.before(detect_strikes),
                 detect_strikes.before(PhysicsStepSystems::First),
                 record_tick_state.after(PhysicsStepSystems::Last),
@@ -93,7 +94,8 @@ pub fn run() {
             FixedUpdate,
             (drain_server_events).run_if(in_state(AppState::Playing))
         )
-        .add_systems(OnEnter(AppState::RoundEnded), setup_round_ended)
-        .add_systems(OnExit(AppState::RoundEnded), cleanup_round_ended)
+        .add_systems(OnEnter(AppState::RoundEndAnimation), setup_round_ended)
+        .add_systems(Update, animate_round_end.run_if(in_state(AppState::RoundEndAnimation)))
+        // .add_systems(OnExit(AppState::RoundEndAnimation), cleanup_round_ended)
         .run();
 }
