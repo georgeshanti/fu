@@ -99,32 +99,37 @@ pub fn is_game_server_running() -> bool {
     GAME_SERVER.lock().unwrap().is_some()
 }
 
-#[derive(PartialEq)]
+#[derive(PartialEq, Debug)]
 enum GamePhase {
     Lobby,
     RoundStarting,
     RoundPlaying,
     RoundPaused,
-    RoundScore,
     RoundEnded,
     GameEnded,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Copy, Clone, Debug, Serialize, Deserialize)]
 pub enum PlayerBoomerangState {
     Stationary,
     Swinging{elapsed: f32},
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Copy, Clone, Debug, Serialize, Deserialize)]
 pub enum PlayerStatus {
     Alive,
     Dying { elapsed: f32 },
     Dead,
 }
 
+#[derive(Copy, Clone, Debug, Serialize, Deserialize)]
+pub enum ThrowingState {
+    StartThrow,
+    Throwing{elapsed: f32},
+}
+
 /// A snapshot of one locally-controlled player's physics at a given tick.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Copy, Clone, Debug, Serialize, Deserialize)]
 pub struct PlayerState {
     pub status: PlayerStatus,
     pub player_id: u8,
@@ -134,11 +139,22 @@ pub struct PlayerState {
     pub rotation: Quat,
     pub acceleration: Vec3,
     pub bommerang: Option<PlayerBoomerangState>,
+    pub throwing_state: Option<ThrowingState>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ThrownBoomerangeState {
+    pub player_id: u8,
+    pub position: Vec3,
+    pub velocity: Vec3,
+    pub rotation: Quat,
+    pub acceleration: Vec3,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GameState {
     pub players: Vec<PlayerState>,
+    pub thrown_boomerangs: Vec<ThrownBoomerangeState>,
 }
 
 /// Events originating from the server, sent out to clients.
@@ -156,7 +172,9 @@ pub enum ServerEvent {
     GameEffect {tick: u64, game_event: GameEffect},
     GameStateRequest,
     OverrideGameState {tick: u64, game_state: GameState},
-    RoundEnded{ max: u8, old_score: BTreeMap<u8, u8>, new_score: BTreeMap<u8, u8> },
+    RoundEnded{ max: u8, old_score: BTreeMap<u8, u8>, new_score: BTreeMap<u8, u8>},
+    GameEnded{ max: u8, old_score: BTreeMap<u8, u8>, new_score: BTreeMap<u8, u8>, game_winners: Vec<Player> },
+    BackToLobby,
 }
 
 #[derive(Event, Debug, Clone, Serialize, Deserialize)]
@@ -181,6 +199,10 @@ pub enum ClientEvent {
     FetchLobby,
     /// Asks the server to begin the round (sent from the lobby "Start Game" button).
     StartGame,
+    /// Asks the server to reset its round state and start the next round (sent from
+    /// the round-ended overlay's "Continue" button). Any client may send it; the
+    /// server's phase guard collapses duplicates from several clients into one round.
+    MoveToNextRound,
     /// Sent once a client has finished spawning the platform and its players.
     RoundPing{ tick: u64 },
     PlayersSpawned { client_id: u8 },
@@ -188,6 +210,7 @@ pub enum ClientEvent {
     GameEffect {tick: u64, game_event: GameEffect},
     UndoGameEffect {tick: u64, game_event: GameEffect},
     GameStateResponse {tick: u64, game_state: GameState},
+    EndGame,
 }
 
 #[derive(Event, Debug, Clone, Serialize, Deserialize, PartialEq, PartialOrd, Eq, Ord)]
@@ -195,6 +218,9 @@ pub enum PlayerAction {
     Movement { player_id: u8, x: OrderedF32, y: OrderedF32 },
     Swing { player_id: u8 },
     Jump { player_id: u8, x: OrderedF32, y: OrderedF32  },
+    StartingThrowing { player_id: u8, x: OrderedF32, y: OrderedF32  },
+    // TurnThrow { player_id: u8, x: OrderedF32, y: OrderedF32  },
+    ReleaseThrow { player_id: u8, power: OrderedF32, x: OrderedF32, y: OrderedF32  },
 }
 
 #[derive(Event, Debug, Clone, Serialize, Deserialize, PartialEq, PartialOrd, Eq, Ord)]
@@ -210,7 +236,7 @@ pub enum Controller {
     Gamepad(u32),
 }
 
-#[derive(Ord, PartialEq, PartialOrd, Eq)]
+#[derive(Ord, PartialEq, PartialOrd, Eq, Debug)]
 struct PlayerDeathEvent {
     dead_player_id: u8,
     score_player_id: u8,
@@ -261,6 +287,22 @@ impl MultipleSenders<()> for Vec<Sender<()>> {
     }
 }
 
+/// Pairs every player in the roster with the point it spawns at for a round:
+/// evenly spaced along the X axis, 2 units apart, centered on the origin, and
+/// dropped in from 6 units up. Shared by the first round (`StartGame`) and every
+/// subsequent one (`MoveToNextRound`) so both lay the field out identically.
+fn spawn_points(roster: Vec<Player>) -> Vec<(Player, Vec3)> {
+    let n = roster.len();
+    roster
+        .into_iter()
+        .enumerate()
+        .map(|(i, player)| {
+            let x = (i as f32 - (n as f32 - 1.0) / 2.0) * 2.0;
+            (player, Vec3::new(x, 6.0, 0.0))
+        })
+        .collect()
+}
+
 impl GameServer {
     pub fn new() -> (Self, Sender<ClientEventOuter>) {
         let (sender, receiver) = mpsc::channel();
@@ -299,12 +341,14 @@ impl GameServer {
     }
 
     pub fn start_round_end_listener(self: &Self, senders: Vec<Sender<()>>) {
+        let players = self.players.clone();
         let player_death_events = self.player_death_events.clone();
         let active_clients = self.active_clients.clone();
         let alive_players = self.alive_players.clone();
         let clients = self.clients.clone();
         let player_scores = self.player_scores.clone();
         let old_scores = self.old_player_scores.clone();
+        let phase = self.phase.clone();
         thread::spawn(move || {
             loop {
                 sleep(Duration::from_millis(250));
@@ -314,6 +358,7 @@ impl GameServer {
                 for player_death_event in player_death_events.iter() {
                     let mut acknowledge_dead_players_at_tick = true;
                     for player_death_event in player_death_event.1.iter() {
+                        println!("player_death_event: {:?} {:?}", player_death_event.0, player_death_event.0);
                         let active_clients = active_clients.lock().unwrap();
                         if !active_clients.is_subset(player_death_event.1) {
                             acknowledge_dead_players_at_tick = false;
@@ -329,6 +374,7 @@ impl GameServer {
                                 let mut player_score = player_scores.get(&player_death_event.0.score_player_id);
                                 **player_score.get_or_insert(&0)
                             };
+                            println!("Incrementing score for player: {} to {}", player_death_event.0.score_player_id, player_score+1);
                             player_scores.insert(player_death_event.0.score_player_id, player_score+1);
                         }
                         ticks_to_remove.push(*player_death_event.0);
@@ -339,13 +385,47 @@ impl GameServer {
                 for tick_to_remove in ticks_to_remove {
                     player_death_events.remove(&tick_to_remove);
                 }
+                alive_player_change = false;
                 if alive_player_change {
+                    let winning_score = 2;
                     let alive_players = alive_players.lock().unwrap();
                     if alive_players.len() <=1 {
                         senders.send(());
                         for client in clients.lock().unwrap().1.iter() {
-                            let _ = client.1.send(ServerEvent::RoundEnded{ max: 20, old_score: old_scores.lock().unwrap().clone(), new_score: player_scores.lock().unwrap().clone()});
+                            let winners: Vec<(u8, u8)> = player_scores.lock().unwrap().clone().iter().filter(|score| {
+                                *score.1 >= winning_score
+                            }).map(|score| {(*score.0, *score.1)}).collect();
+                            let winners = if winners.len() > 0 {
+                                let players= players.lock().unwrap();
+                                winners.iter().map(|winner| {
+                                    players.iter().filter(|player| { player.id == winner.0 }).map(|p| { p.clone() }).collect::<Vec<Player>>().get(0).unwrap().clone()
+                                }).collect::<Vec<Player>>()
+                            } else {
+                                vec![]
+                            };
+                            let mut phase = phase.lock().unwrap();
+                            if winners.len() > 0 {
+                                let _ = client.1.send(ServerEvent::GameEnded {
+                                    max: winning_score,
+                                    old_score: old_scores.lock().unwrap().clone(),
+                                    new_score: player_scores.lock().unwrap().clone(),
+                                    game_winners: winners,
+                                });
+                                *phase = GamePhase::GameEnded;
+                            } else {
+                                let _ = client.1.send(ServerEvent::RoundEnded{
+                                    max: winning_score,
+                                    old_score: old_scores.lock().unwrap().clone(),
+                                    new_score: player_scores.lock().unwrap().clone(),
+                                });
+                                *phase = GamePhase::RoundEnded;
+                            }
                         }
+                        // One listener per round: a fresh one is spawned on the next
+                        // `PlayersSpawned`. Without this return the round-1 thread would
+                        // still be polling during round 2 and race the new listener into
+                        // a second `RoundEnded` broadcast.
+                        return;
                     }
                 }
             }
@@ -382,6 +462,8 @@ impl GameServer {
         let player_death_events = self.player_death_events.clone();
         let active_clients = self.active_clients_buffer.clone();
         let alive_players = self.alive_players.clone();
+        let player_scores = self.player_scores.clone();
+        let old_player_scores = self.old_player_scores.clone();
         let server = self.clone();
 
         // Event Handler
@@ -420,19 +502,65 @@ impl GameServer {
                         // }
                         *phase = GamePhase::RoundStarting;
                         pending_client_starts.lock().unwrap().clear();
-                        let roster = players.clone();
-                        let n = roster.len();
-                        let spawns: Vec<(Player, Vec3)> = roster
-                            .into_iter()
-                            .enumerate()
-                            .map(|(i, player)| {
-                                // Evenly spaced along the X axis, 2 units apart, centered on origin.
-                                let x = (i as f32 - (n as f32 - 1.0) / 2.0) * 2.0;
-                                (player, Vec3::new(x, 6.0, 0.0))
-                            })
-                            .collect();
+                        let spawns = spawn_points(players.clone());
                         for client in clients_guard.1.values() {
                             let _ = client.send(ServerEvent::SpawnPlayers { spawns: spawns.clone() });
+                        }
+                    }
+                    ClientEvent::MoveToNextRound => {
+                        // The phase guard doubles as the dedupe: the first client's
+                        // "Continue" flips us out of `RoundPlaying`, so any others
+                        // arriving for the same round are dropped here.
+                        println!("Moving to next round from: {:?}", *phase);
+                        if *phase != GamePhase::RoundEnded { continue };
+                        *phase = GamePhase::RoundStarting;
+
+                        // Carry this round's totals forward as the next round's starting
+                        // point, so its `RoundEnded` scoreboard animates from them rather
+                        // than replaying every point from zero.
+                        *old_player_scores.lock().unwrap() = player_scores.lock().unwrap().clone();
+
+                        // Clients restart their `Ticker` at 0 in `wait_for_start`, so the
+                        // tick-keyed buffers from the finished round must not survive into
+                        // the next one — their old ticks would collide with the new ones.
+                        pending_client_starts.lock().unwrap().clear();
+                        game_effects.lock().unwrap().clear();
+                        player_death_events.lock().unwrap().clear();
+                        *last_received_tick.lock().unwrap() = None;
+
+                        // `alive_players` is deliberately left alone: the `PlayersSpawned`
+                        // arm below repopulates it from the roster once every client has
+                        // rebuilt the scene.
+                        let spawns = spawn_points(players.lock().unwrap().clone());
+                        for client in clients_guard.1.values() {
+                            let _ = client.send(ServerEvent::SpawnPlayers { spawns: spawns.clone() });
+                        }
+                    }
+                    ClientEvent::EndGame => {
+                        // The phase guard doubles as the dedupe: the first client's
+                        // "Continue" flips us out of `RoundPlaying`, so any others
+                        // arriving for the same round are dropped here.
+                        if *phase != GamePhase::GameEnded { continue };
+                        *phase = GamePhase::Lobby;
+
+                        // Carry this round's totals forward as the next round's starting
+                        // point, so its `RoundEnded` scoreboard animates from them rather
+                        // than replaying every point from zero.
+                        *old_player_scores.lock().unwrap() = BTreeMap::new();
+                        *player_scores.lock().unwrap() = BTreeMap::new();
+
+                        // Clients restart their `Ticker` at 0 in `wait_for_start`, so the
+                        // tick-keyed buffers from the finished round must not survive into
+                        // the next one — their old ticks would collide with the new ones.
+                        pending_client_starts.lock().unwrap().clear();
+                        game_effects.lock().unwrap().clear();
+                        player_death_events.lock().unwrap().clear();
+                        *last_received_tick.lock().unwrap() = None;
+                        alive_players.lock().unwrap().clear();
+
+                        let roster = players.lock().unwrap().clone();
+                        for client in clients_guard.1.values() {
+                            let _ = client.send(ServerEvent::BackToLobby);
                         }
                     }
                     ClientEvent::PlayersSpawned { client_id } => {
@@ -448,6 +576,9 @@ impl GameServer {
                             }
                             {
                                 let (sender, receiver) = mpsc::channel();
+                                // Previous rounds' monitors have already been stopped, so
+                                // drop their senders rather than pulsing dead channels.
+                                round_enders.clear();
                                 round_enders.push(sender.clone());
                                 server.monitor_active_clients(receiver);
 
@@ -489,6 +620,7 @@ impl GameServer {
                         });
                     }
                     ClientEvent::GameEffect { tick, game_event } => {
+                        println!("tick: {}, Received game effect: {:?}", tick, game_event);
                         if *phase != GamePhase::RoundPlaying { continue };
                         let mut game_effects = game_effects.lock().unwrap();
                         if !game_effects.contains_key(&tick) {

@@ -77,6 +77,10 @@ pub fn run() {
                 move_player,
                 apply_dead_collision_layers,
                 animate_death,
+                start_throwing,
+                start_throw_animation,
+                animate_throwing_action,
+                release_throw,
             )
                 .run_if(in_state(AppState::Playing)),
         )
@@ -94,8 +98,13 @@ pub fn run() {
             FixedUpdate,
             (drain_server_events).run_if(in_state(AppState::Playing))
         )
-        .add_systems(OnEnter(AppState::RoundEndAnimation), setup_round_ended)
+        .add_systems(OnEnter(AppState::RoundEndAnimation), start_round_end_animation)
         .add_systems(Update, animate_round_end.run_if(in_state(AppState::RoundEndAnimation)))
-        // .add_systems(OnExit(AppState::RoundEndAnimation), cleanup_round_ended)
+        .add_systems(OnEnter(AppState::RoundEnded), setup_round_ended)
+        .add_systems(
+            Update,
+            (handle_continue_button, wait_for_next_round).run_if(in_state(AppState::RoundEnded)),
+        )
+        .add_systems(OnExit(AppState::RoundEnded), cleanup_round_ended)
         .run();
 }

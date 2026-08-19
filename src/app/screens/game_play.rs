@@ -1,10 +1,10 @@
-use std::{backtrace::Backtrace, collections::{BTreeMap, BTreeSet}, time::{Duration, SystemTime}};
+use std::{collections::{BTreeMap, BTreeSet}, time::{Duration, SystemTime}};
 
-use avian3d::{dynamics::integrator::IntegrationSystems::Velocity, prelude::*};
-use bevy::{ecs::{change_detection::Tick, system::SystemState}, prelude::*};
+use avian3d::{prelude::*};
+use bevy::{ecs::{system::SystemState}, prelude::*};
 
 use crate::{
-    app::{GameClientWrapper, screens::{app_state::AppState, lobby::PendingSpawns}}, server::{self, ClientEvent, Controller, GameEffect, GameState, OrderedF32, PlayerAction, PlayerBoomerangState, PlayerState, PlayerStatus, ServerEvent},
+    app::{GameClientWrapper, screens::{app_state::AppState, lobby::PendingSpawns}}, server::{self, ClientEvent, Controller, GameEffect, GameState, OrderedF32, PlayerAction, PlayerBoomerangState, PlayerState, PlayerStatus, ServerEvent, ThrowingState, ThrownBoomerangeState},
 };
 
 /// Identifies an entity as a player-controlled body.
@@ -48,6 +48,14 @@ pub struct Alive;
 #[derive(Component)]
 pub struct Dead;
 
+#[derive(Component)]
+pub struct StartThrow;
+
+#[derive(Component)]
+pub struct ThrowingAnimation {
+    elapsed: f32,
+}
+
 /// Physics collision layers. Living players and their blades stay on the implicit
 /// `Default` layer; the platform gets its own layer so a `Dead` body can filter to
 /// touch only the platform (and thus pass through every other player and boomerang).
@@ -78,6 +86,9 @@ const SWING_PEAK_ANGLE: f32 = std::f32::consts::FRAC_PI_2;
 pub struct Swinging {
     elapsed: f32,
 }
+
+#[derive(Component)]
+pub struct Thrown {player_id: Option<u8>}
 
 /// Minimum delay after a swing ends before the player may swing again.
 const SWING_COOLDOWN: std::time::Duration = std::time::Duration::from_millis(800);
@@ -131,7 +142,7 @@ pub struct PlayerDirection {
 pub struct PlayerDirections(BTreeMap<u8, PlayerDirection>);
 
 #[derive(Resource, Default)]
-pub struct PlayerInfos(pub Vec<PlayerInfo>);
+pub struct PlayerInfos(Vec<PlayerInfo>);
 
 #[derive(Clone)]
 pub struct TickRecord {
@@ -216,6 +227,21 @@ pub struct CountdownText;
 #[derive(Component)]
 pub struct RoundEndedOverlay;
 
+/// The "Continue" button on the round-ended overlay: starts the next round.
+#[derive(Component)]
+pub struct ContinueButton;
+
+/// The static parts of the playfield — light and platform. Tagged so they can be
+/// despawned between rounds; without that, re-entering `AppState::SpawningPlayers`
+/// would stack a second copy of each on top of the first.
+#[derive(Component)]
+pub struct GamePlayRoot;
+
+/// The gameplay `Camera3d`. Separate from `GamePlayRoot` only to follow the
+/// `XxxRoot` + `XxxCamera` convention every other screen uses.
+#[derive(Component)]
+pub struct GamePlayCamera;
+
 /// Fixed width of the scoreboard's name column, in logical pixels. Fixed (rather than
 /// content-sized) so the point pips start at the same x on every row and read as columns.
 const SCORE_NAME_COLUMN_WIDTH: f32 = 200.0;
@@ -234,6 +260,7 @@ pub struct Score{
     max: u8,
     old_score: BTreeMap<u8, u8>,
     new_score: BTreeMap<u8, u8>,
+    winners: Vec<u8>,
 }
 
 /// Constant linear acceleration applied to the player to overcome ground friction.
@@ -259,6 +286,7 @@ pub fn setup_game_play(
     commands.spawn((
         Camera3d::default(),
         Transform::from_xyz(0.0, 5.0, 12.0).looking_at(Vec3::ZERO, Vec3::Y),
+        GamePlayCamera,
     ));
 
     // Directional light so the meshes are visible.
@@ -268,6 +296,7 @@ pub fn setup_game_play(
             ..default()
         },
         Transform::from_xyz(4.0, 8.0, 4.0).looking_at(Vec3::ZERO, Vec3::Y),
+        GamePlayRoot,
     ));
 
     // Static platform (20 x 20).
@@ -283,16 +312,14 @@ pub fn setup_game_play(
             dynamic_coefficient: 1.0,
             combine_rule: CoefficientCombine::Max,
         },
+        GamePlayRoot,
     ));
 
     // One dynamic cube per player, at the spawn point assigned by the server.
     if let Some(spawns) = spawns {
         // Shared assets for the L-shaped object held off each player's right side.
         // The L lies flat in the horizontal (X-Z) plane, thin in Y, at cube mid-height.
-        let l_spine_mesh = meshes.add(Cuboid::new(1.0, 0.1, 0.2));
-        let l_foot_mesh = meshes.add(Cuboid::new(0.2, 0.1, 0.8));
-        let l_material = materials.add(Color::srgb(0.7, 0.7, 0.7));
-        let mut game_state = GameState { players: spawns.0.iter().map(|(player, position)| {
+        let game_state = GameState { players: spawns.0.iter().map(|(player, position)| {
             PlayerState {
                 status: PlayerStatus::Alive,
                 player_id: player.id,
@@ -302,56 +329,11 @@ pub fn setup_game_play(
                 rotation: Quat::from_rotation_x(0.0),
                 acceleration: Vec3::ZERO,
                 bommerang: Some(PlayerBoomerangState::Stationary),
+                throwing_state: None,
             }
-        }).collect() };
-        // for (player, position) in &spawns.0 {
-        //     commands
-        //         .spawn((
-        //             Mesh3d(meshes.add(Cylinder::new(0.5, 1.0))),
-        //         MeshMaterial3d(materials.add(player.color.to_bevy_color())),
-        //             Transform::from_translation(*position),
-        //             RigidBody::Dynamic,
-        //             Collider::cylinder(0.5, 1.0),
-        //             // Facing is driven manually (see `drain_server_events`); lock physics
-        //             // rotation so collisions don't tumble the cube and fight that facing.
-        //             LockedAxes::ROTATION_LOCKED,
-        //             ConstantLinearAcceleration(Vec3::ZERO),
-        //             PlayerId { player_id: player.id, color: player.color },
-        //         ))
-        //         .with_children(|parent| {
-        //             // The L as a single entity, anchored at the point where it meets the
-        //             // cube (the right face, local x = 0.5). Its segments are positioned
-        //             // relative to this anchor.
-        //             parent
-        //                 .spawn((
-        //                     Boomerang,
-        //                     Transform::from_xyz(0.5, 0.0, 0.0),
-        //                     Visibility::default(),
-        //                 ))
-        //                 .with_children(|l| {
-        //                     // L spine: runs along +X out from the anchor (cube right face).
-        //                     l.spawn((
-        //                         Mesh3d(l_spine_mesh.clone()),
-        //                         MeshMaterial3d(l_material.clone()),
-        //                         Transform::from_xyz(0.5, 0.0, 0.0),
-        //                         Collider::cuboid(1.0, 0.1, 0.2),
-        //                         BoomerangBlade,
-        //                         CollisionEventsEnabled,
-        //                     ));
-        //                     // L foot: turns in -Z at the outer end, forming the base of the L
-        //                     // (mirrored about the xy plane).
-        //                     l.spawn((
-        //                         Mesh3d(l_foot_mesh.clone()),
-        //                         MeshMaterial3d(l_material.clone()),
-        //                         Transform::from_xyz(0.9, 0.0, -0.3),
-        //                         Collider::cuboid(0.2, 0.1, 0.8),
-        //                         BoomerangBlade,
-        //                         CollisionEventsEnabled,
-        //                     ));
-        //                 });
-        //         });
-        // }
-        spawn_world(&mut commands, &mut materials, &mut meshes, players, game_state);
+        }).collect(),
+        thrown_boomerangs: vec![] };
+        spawn_world(&mut commands, &Ticker(0, false), &mut materials, &mut meshes, players, game_state);
         commands.insert_resource(PlayerInfos(spawns.0.iter().map(|player| { PlayerInfo { player_id: player.0.id, color: player.0.color, name: player.0.name.clone()} }).collect()));
     }
 
@@ -459,6 +441,9 @@ impl ToBevyColor for server::Color {
 }
 
 #[derive(Component)]
+pub struct RoundEndTitle;
+
+#[derive(Component)]
 pub struct PointRow {
     player_id: u8,
     color: server::Color,
@@ -474,7 +459,7 @@ pub struct PointIndex {
 /// (movement, swings, strike detection, event draining) stops running on the state
 /// change, so the field simply freezes as it was and this dimmed UI layer draws on
 /// top of it — same trick as the pre-game countdown overlay.
-pub fn setup_round_ended(mut commands: Commands, score: Option<Res<Score>>, player_infos: Res<PlayerInfos>) {
+pub fn start_round_end_animation(mut commands: Commands, score: Option<Res<Score>>, player_infos: Res<PlayerInfos>) {
     // The server ends the round as soon as at most one player is still alive, so a
     // lone survivor is the winner; anything else (a same-tick double KO, or a round
     // ended some other way) is reported as a draw.
@@ -500,11 +485,7 @@ pub fn setup_round_ended(mut commands: Commands, score: Option<Res<Score>>, play
                 Text::new("Round Over"),
                 TextFont { font_size: 80.0, ..default() },
                 TextColor(Color::WHITE),
-            ));
-            parent.spawn((
-                Text::new("ROUND"),
-                TextFont { font_size: 40.0, ..default() },
-                TextColor(Color::srgb(0.8, 0.8, 0.8)),
+                RoundEndTitle{},
             ));
 
             // Scoreboard, in its own translucent panel: one row per player, `max + 1`
@@ -559,7 +540,7 @@ pub fn setup_round_ended(mut commands: Commands, score: Option<Res<Score>>, play
                                             border_radius: BorderRadius::MAX,
                                             ..default()
                                         },
-                                        BackgroundColor(if pip < points {
+                                        BackgroundColor(if pip <= points {
                                             info.color.to_bevy_color()
                                         } else {
                                             info.color.to_bevy_color().with_alpha(0.1)
@@ -570,6 +551,66 @@ pub fn setup_round_ended(mut commands: Commands, score: Option<Res<Score>>, play
                     }
                 });
         });
+}
+
+pub fn setup_round_ended(
+    mut commands: Commands,
+    round_end_overlay: Query<Entity, With<RoundEndedOverlay>>,
+    round_end_title: Query<&mut Text, With<RoundEndTitle>>,
+    score: Res<Score>,
+) {
+    if score.winners.len() > 0 {
+        for mut text in round_end_title {
+            let mut winners = String::from("Winners:");
+            let mut index = 0;
+            for winner in score.winners.iter() {
+                if index == 0 {
+                    winners = format!("{} {},", winners, *winner);
+                } else if index == score.winners.len() - 1 {
+                    winners = format!("{} & {},", winners, *winner);
+                } else {
+                    winners = format!("{}, {},", winners, *winner);
+                }
+                index += 1;
+            }
+            *text = Text(winners);
+        }
+    }
+    let game_ended = score.winners.len() > 0;
+    for overlay in round_end_overlay {
+        commands.entity(overlay).with_children(|parent| {
+            // Action row, pinned to the bottom-right corner. The overlay root is itself
+            // absolutely positioned at 100% x 100%, so this anchors against the whole
+            // screen without disturbing the centered column above it. A flex row so more
+            // buttons can sit alongside "Continue" later.
+            parent
+                .spawn(Node {
+                    position_type: PositionType::Absolute,
+                    bottom: Val::Px(24.0),
+                    right: Val::Px(24.0),
+                    flex_direction: FlexDirection::Row,
+                    column_gap: Val::Px(12.0),
+                    ..default()
+                })
+                .with_children(|row| {
+                    row.spawn((
+                        Button,
+                        Node {
+                            width: Val::Px(220.0),
+                            height: Val::Px(60.0),
+                            justify_content: JustifyContent::Center,
+                            align_items: AlignItems::Center,
+                            ..default()
+                        },
+                        BackgroundColor(Color::srgb(0.2, 0.2, 0.25)),
+                        ContinueButton,
+                    ))
+                    .with_children(|button| {
+                        button.spawn((Text::new(if game_ended { "End Game" } else { "Continue" }), TextColor(Color::WHITE)));
+                    });
+                });
+            });
+    }
 }
 
 const POINT_ANIMATION_TIME: Duration = Duration::from_millis(500);
@@ -599,7 +640,7 @@ pub fn animate_round_end(
             }
             index += 1;
         };
-        println!("Animating round end: {:?}", player_id_score);
+
         match player_id_score {
             Some((player_id, player_score)) => {
                 for (point_row, children) in rows {
@@ -607,7 +648,6 @@ pub fn animate_round_end(
                         for child in children {
                             let Ok((point_index, mut background_color)) = points.get_mut(*child) else { continue };
                             if point_index.index == player_score {
-                                println!("Applying color");
                                 *background_color = BackgroundColor(point_row.color.to_bevy_color());
                             }
                         }
@@ -622,12 +662,82 @@ pub fn animate_round_end(
     }
 }
 
-/// Despawns the round-ended overlay on `OnExit(AppState::RoundEnded)`.
+/// Asks the server for the next round when "Continue" is clicked. Any client may
+/// press it; the server's phase guard collapses several clients' clicks into one
+/// round, so no local dedupe is needed here.
+pub fn handle_continue_button(
+    interactions: Query<&Interaction, (Changed<Interaction>, With<ContinueButton>)>,
+    client: Res<GameClientWrapper>,
+    score: Res<Score>,
+) {
+    let event = if score.winners.len() > 0 {
+        ClientEvent::EndGame
+    } else {
+        ClientEvent::MoveToNextRound
+    };
+    for interaction in &interactions {
+        if *interaction == Interaction::Pressed {
+            let client_guard = client.client.read().unwrap();
+            if let Some(sender) = &client_guard.sender {
+                sender.send(event.clone()).ok();
+            }
+        }
+    }
+}
+
+/// Drains server events while the round-ended overlay is up. Any client's "Continue"
+/// makes the server rebroadcast `SpawnPlayers`, which sends every client back through
+/// `SpawningPlayers` for the next round — the same handoff `update_lobby` does for the
+/// first round.
+///
+/// Deliberately not registered for `RoundEndAnimation`: an event arriving mid-animation
+/// just sits in `received_events` until this runs, and keeping the transition inside
+/// `RoundEnded` guarantees `cleanup_round_ended` (on `OnExit`) always tears the scene down.
+pub fn wait_for_next_round(
+    mut commands: Commands,
+    client: Res<GameClientWrapper>,
+    mut next_state: ResMut<NextState<AppState>>,
+) {
+    let client = client.client.read().unwrap();
+    let events = {
+        let mut server_events = client.received_events.lock().unwrap();
+        let events = server_events.clone();
+        *server_events = vec![];
+        events
+    };
+    for event in events {
+        match event {
+            ServerEvent::SpawnPlayers { spawns } => {
+                commands.insert_resource(PendingSpawns(spawns));
+                next_state.set(AppState::SpawningPlayers);
+            }
+            ServerEvent::BackToLobby => {
+                // Leave the scene standing and hand over to `setup_round_ended`, which
+                // draws the result overlay on top of the now-frozen field.
+                next_state.set(AppState::Lobby);
+                return;
+            },
+            _ => {},
+        }
+    }
+}
+
+/// Despawns the round-ended overlay *and the playfield* on `OnExit(AppState::RoundEnded)`.
+///
+/// The scene has to survive `Playing → RoundEndAnimation → RoundEnded` (the overlay draws
+/// on top of the frozen field), so this is the first point at which it can go. Player
+/// bodies are left to `spawn_world`, which despawns every `PlayerId` entity before
+/// rebuilding them. `OnExit` runs before the next state's `OnEnter`, so `setup_game_play`
+/// replaces the camera in the same state transition and no frame renders without one.
 pub fn cleanup_round_ended(
     mut commands: Commands,
     overlay: Query<Entity, With<RoundEndedOverlay>>,
+    scene: Query<Entity, Or<(With<GamePlayRoot>, With<GamePlayCamera>)>>,
 ) {
     for entity in &overlay {
+        commands.entity(entity).despawn();
+    }
+    for entity in &scene {
         commands.entity(entity).despawn();
     }
 }
@@ -641,7 +751,7 @@ pub fn drain_server_events(
     mut params: Local<SystemState<(
         Commands,
         Res<GameClientWrapper>,
-        Query<(Entity, &PlayerId, &mut LinearVelocity, &mut ConstantLinearAcceleration, &mut Rotation, &mut Transform, &Children), Without<Dying>>,
+        Query<(Entity, &PlayerId, &mut LinearVelocity, &mut ConstantLinearAcceleration, &mut Rotation, &mut Transform, Option<&Children>), Without<Dying>>,
         Query<Entity, (With<Boomerang>, Without<Swinging>)>,
         ResMut<Ticker>,
         ResMut<LocalGameEvents>,
@@ -652,7 +762,6 @@ pub fn drain_server_events(
         ResMut<NextState<AppState>>,
     )>>,
 ) {
-    // println!("Draining");
     let (mut new_player_actions, server_events) = {
         let client = params.get_mut(world).1;
         let client = client.client.read().unwrap();
@@ -672,7 +781,16 @@ pub fn drain_server_events(
                 // Leave the scene standing and hand over to `setup_round_ended`, which
                 // draws the result overlay on top of the now-frozen field.
                 let (mut commands, _, _, _, _, _, _, _, _, _, mut next_state) = params.get_mut(world);
-                commands.insert_resource(Score{time: SystemTime::now(), max, old_score, new_score});
+                commands.insert_resource(Score{time: SystemTime::now(), max, old_score, new_score, winners: vec![]});
+                next_state.set(AppState::RoundEndAnimation);
+                params.apply(world);
+                return;
+            },
+            ServerEvent::GameEnded{ max, old_score, new_score, game_winners} => {
+                // Leave the scene standing and hand over to `setup_round_ended`, which
+                // draws the result overlay on top of the now-frozen field.
+                let (mut commands, _, _, _, _, _, _, _, _, _, mut next_state) = params.get_mut(world);
+                commands.insert_resource(Score{time: SystemTime::now(), max, old_score, new_score, winners: game_winners.iter().map(|winner| {winner.id}).collect()});
                 next_state.set(AppState::RoundEndAnimation);
                 params.apply(world);
                 return;
@@ -689,7 +807,7 @@ pub fn drain_server_events(
             let first_tick = new_player_actions.first().unwrap().0;
             let (mut commands, _, _, _, mut ticker, mut local_game_events, players, mut meshes, mut materials, mut in_replay, _) = params.get_mut(world);
             let game_state = local_game_events.game_events.get(first_tick as usize).unwrap().game_state.clone();
-            spawn_world(&mut commands, &mut materials, &mut meshes, players, game_state);
+            spawn_world(&mut commands, &ticker, &mut materials, &mut meshes, players, game_state);
             ticker.0 = first_tick;
             in_replay.0 = true;
             let existing_records = local_game_events.game_events[first_tick as usize..].to_vec();
@@ -774,7 +892,7 @@ fn apply_action_to_world(
     params: &mut Local<SystemState<(
         Commands,
         Res<GameClientWrapper>,
-        Query<(Entity, &PlayerId, &mut LinearVelocity, &mut ConstantLinearAcceleration, &mut Rotation, &mut Transform, &Children), Without<Dying>>,
+        Query<(Entity, &PlayerId, &mut LinearVelocity, &mut ConstantLinearAcceleration, &mut Rotation, &mut Transform, Option<&Children>), Without<Dying>>,
         Query<Entity, (With<Boomerang>, Without<Swinging>)>,
         ResMut<Ticker>,
         ResMut<LocalGameEvents>,
@@ -814,11 +932,13 @@ fn apply_action_to_world(
         PlayerAction::Swing { player_id } => {
             for (_entity, entity_player_id, mut vel, mut accel, mut rotation, mut transform, children) in &mut query {
                 if entity_player_id.player_id != *player_id { continue; }
-                for child in children.iter() {
-                    if let Ok(boomerang) = lobjects.get(child) {
-                        *vel = LinearVelocity(Vec3::ZERO);
-                        *accel = ConstantLinearAcceleration(Vec3::ZERO);
-                        commands.entity(boomerang).insert(Swinging { elapsed: 0.0 });
+                if let Some(children) = children {
+                    for child in children.iter() {
+                        if let Ok(boomerang) = lobjects.get(child) {
+                            *vel = LinearVelocity(Vec3::ZERO);
+                            *accel = ConstantLinearAcceleration(Vec3::ZERO);
+                            commands.entity(boomerang).insert(Swinging { elapsed: 0.0 });
+                        }
                     }
                 }
             }
@@ -837,7 +957,50 @@ fn apply_action_to_world(
                     }
                 }
             }
-        }
+        },
+        PlayerAction::StartingThrowing { player_id, x, y } => {
+            for (_entity, player, mut vel, mut accel, mut rotation, mut transform, children) in &mut query {
+                if player.player_id == *player_id {
+                    vel.x = 0.0;
+                    vel.z = 0.0;
+                    vel.y = 0.0;
+                    *accel = ConstantLinearAcceleration(Vec3::ZERO);
+                    if Vec3::new(x.0, 0.0, y.0).length_squared() > 1e-6 {
+                        let yaw = Quat::from_rotation_y(f32::atan2(-x.0, -y.0));
+                        *rotation = yaw.into();
+                        transform.rotation = yaw;
+                    }
+                    let lobject_children: Vec<Entity> = if let Some(children) = children {
+                        children.iter().filter(|child| { lobjects.get(*child).is_ok() }).collect()
+                    } else {
+                        vec![]
+                    };
+                    if !lobject_children.is_empty() {
+                        commands.entity(_entity).insert(StartThrow {});
+                    }
+                }
+            }
+        },
+        PlayerAction::ReleaseThrow { player_id, power, x, y } => {
+            println!("Got release throw event");
+            for (_entity, player, mut vel, mut accel, mut rotation, mut transform, children) in &mut query {
+                if player.player_id == *player_id {
+                    commands.entity(_entity).remove::<ThrowingAnimation>();
+                    if let Some(children) = children {
+                        for child in children {
+                            if let Ok(boomrang) = lobjects.get(*child) {
+                                println!("Has boomerang child: {}", ticker.0);
+                                commands.entity(_entity).detach_child(boomrang);
+                                commands.entity(boomrang).insert((
+                                    LinearVelocity::from(Vec3{x:x.0, y: 0.0, z: y.0}.normalize_or_zero() * power.0),
+                                    Thrown{player_id: Some(*player_id)},
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        },
     }
     params.apply(world);
 }
@@ -993,7 +1156,6 @@ pub fn start_swing(
         let proceed = match player_move_cooldown {
             Some(time) => {
                 let now = std::time::SystemTime::now();
-                println!("time: {:?}, now: {:?}", *time, now);
                 *time<=now
             },
             None => true, 
@@ -1026,7 +1188,6 @@ pub fn start_jump(
     };
     let mut jumps = vec![];
     if keyboard.pressed(KeyCode::Space) {
-        println!("Jump");
         if let Some((id, _)) = roster.iter().find(|(_, c)| *c == Controller::Keyboard) {
             for player in &players {
                 if player.player_id != *id { continue; }
@@ -1048,7 +1209,6 @@ pub fn start_jump(
         let proceed = match player_move_cooldown {
             Some(time) => {
                 let now = std::time::SystemTime::now();
-                println!("time: {:?}, now: {:?}", *time, now);
                 *time<=std::time::SystemTime::now()
             },
             None => true,
@@ -1056,11 +1216,170 @@ pub fn start_jump(
         if !proceed { continue; }
         player_move_cooldowns.0.insert(jump, std::time::SystemTime::now() + JUMP_COOLDOWN);
         let player_direction = player_directions.0.get(&jump).unwrap().direction_facing;
-        println!("Now here: {:?}", player_direction);
         let player_direction = player_direction * 8.0;
-        println!("Now here2: {:?}", player_direction);
         let game_event = PlayerAction::Jump { player_id: jump, x: OrderedF32(player_direction.x), y: OrderedF32(player_direction.z) };
         record_player_action(&client, &ticker, &mut sent_events, &game_event, true);
+    }
+}
+
+/// On a gamepad West-button (left action) press, or the keyboard's Z key, start a
+/// forward swing on the pressing player's `LObject`. Reuses the same controller→player
+/// roster mapping as `move_player`. A press while a swing is already in flight is a
+/// no-op (the `Without<Swinging>` filter).
+pub fn start_throwing(
+    keyboard: Res<ButtonInput<KeyCode>>,
+    gamepads: Query<(Entity, &Gamepad)>,
+    client: Res<GameClientWrapper>,
+    ticker: Res<Ticker>,
+    mut sent_events: ResMut<LocalGameEvents>,
+    players: Query<&PlayerId, (Without<Dying>, Without<Dead>, Without<StartThrow>, Without<ThrowingAnimation>)>,
+    player_directions: Res<PlayerDirections>,
+) {
+    let roster: Vec<(u8, Controller)> = {
+        let client = client.client.read().unwrap();
+        let players = client.players.read().unwrap();
+        players.iter().map(|p| (p.id, p.controller)).collect()
+    };
+    let mut throwings = vec![];
+    if keyboard.pressed(KeyCode::KeyX) {
+        if let Some((id, _)) = roster.iter().find(|(_, c)| *c == Controller::Keyboard) {
+            for player in &players {
+                if player.player_id != *id { continue; }
+                throwings.push(*id);
+            }
+        }
+    }
+
+    for (entity, gamepad) in &gamepads {
+        if !gamepad.any_pressed([GamepadButton::RightTrigger2, GamepadButton::North]) { continue; }
+        let controller = Controller::Gamepad(entity.index().index());
+        let Some((id, _)) = roster.iter().find(|(_, c)| *c == controller) else { continue; };
+        for player in &players {
+            if player.player_id != *id { continue; }
+            throwings.push(*id);
+        }
+    }
+
+    for throwing in throwings {
+        let player_direction = player_directions.0.get(&throwing).unwrap().direction_facing;
+        let player_direction = player_direction * 8.0;
+        let game_event = PlayerAction::StartingThrowing { player_id: throwing, x: OrderedF32(player_direction.x), y: OrderedF32(player_direction.z) };
+        record_player_action(&client, &ticker, &mut sent_events, &game_event, true);
+    }
+}
+
+pub fn release_throw(
+    keyboard: Res<ButtonInput<KeyCode>>,
+    gamepads: Query<(Entity, &Gamepad)>,
+    client: Res<GameClientWrapper>,
+    ticker: Res<Ticker>,
+    mut sent_events: ResMut<LocalGameEvents>,
+    players: Query<(&PlayerId, &ThrowingAnimation), (Without<Dying>, Without<Dead>, With<ThrowingAnimation>)>,
+    player_directions: Res<PlayerDirections>,
+) {
+    let roster: Vec<(u8, Controller)> = {
+        let client = client.client.read().unwrap();
+        let players = client.players.read().unwrap();
+        players.iter().map(|p| (p.id, p.controller)).collect()
+    };
+    let mut throwings = vec![];
+    if !keyboard.pressed(KeyCode::KeyX) {
+        if let Some((id, _)) = roster.iter().find(|(_, c)| *c == Controller::Keyboard) {
+            for (player, throwing) in &players {
+                if player.player_id != *id { continue; }
+                throwings.push((*id, throwing.elapsed.clamp(0.0, 2.0) / 2.0));
+            }
+        }
+    }
+
+    for (entity, gamepad) in &gamepads {
+        if gamepad.any_pressed([GamepadButton::RightTrigger2, GamepadButton::North]) { continue; }
+        let controller = Controller::Gamepad(entity.index().index());
+        let Some((id, _)) = roster.iter().find(|(_, c)| *c == controller) else { continue; };
+        for (player, throwing) in &players {
+            if player.player_id != *id { continue; }
+            throwings.push((*id, throwing.elapsed.clamp(0.0, 2.0) / 2.0));
+        }
+    }
+
+    for throwing in throwings {
+        let player_direction = player_directions.0.get(&throwing.0).unwrap().direction_facing;
+        let player_direction = player_direction * 2.0;
+        let game_event = PlayerAction::ReleaseThrow { player_id: throwing.0, power: OrderedF32(throwing.1), x: OrderedF32(player_direction.x), y: OrderedF32(player_direction.z) };
+        record_player_action(&client, &ticker, &mut sent_events, &game_event, true);
+    }
+}
+
+#[derive(Component)]
+pub struct ThrowIndicator;
+
+/// On a gamepad West-button (left action) press, or the keyboard's Z key, start a
+/// forward swing on the pressing player's `LObject`. Reuses the same controller→player
+/// roster mapping as `move_player`. A press while a swing is already in flight is a
+/// no-op (the `Without<Swinging>` filter).
+pub fn start_throw_animation(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    client: Res<GameClientWrapper>,
+    players: Query<(Entity, &PlayerId, &StartThrow, &Children), With<StartThrow>>,
+) {
+    let roster: Vec<(u8, Controller)> = {
+        let client = client.client.read().unwrap();
+        let players = client.players.read().unwrap();
+        players.iter().map(|p| (p.id, p.controller)).collect()
+    };
+
+    let l_spine_mesh = meshes.add(Cuboid::new(0.4, 0.1, 0.1));
+    let l_foot_mesh = meshes.add(Cuboid::new(0.1, 0.1, 0.5));
+    let l_material = materials.add(Color::srgb(0.7, 0.7, 0.7));
+
+    for (entity, player_id, start_throw, children) in players {
+        commands.entity(entity).with_children(|parent| {
+            parent.spawn((
+                ThrowIndicator,
+                Transform::from_xyz(0.0, 0.0, -1.0).with_rotation(Quat::from_rotation_y(f32::atan2(-1.0, 1.0))),
+            ))
+                .with_children(|l| {
+                    // L spine: runs along +X out from the anchor (cube right face).
+                    l.spawn((
+                        Mesh3d(l_spine_mesh.clone()),
+                        MeshMaterial3d(l_material.clone()),
+                        Transform::from_xyz(0.3, 0.0, 0.05),
+                    ));
+                    // L foot: turns in -Z at the outer end, forming the base of the L
+                    // (mirrored about the xy plane).
+                    l.spawn((
+                        Mesh3d(l_foot_mesh.clone()),
+                        MeshMaterial3d(l_material.clone()),
+                        Transform::from_xyz(0.05, 0.0, 0.25),
+                    ));
+                });
+        }).remove::<StartThrow>().insert(ThrowingAnimation{
+            elapsed: 0.0,
+        });
+    }
+}
+
+/// On a gamepad West-button (left action) press, or the keyboard's Z key, start a
+/// forward swing on the pressing player's `LObject`. Reuses the same controller→player
+/// roster mapping as `move_player`. A press while a swing is already in flight is a
+/// no-op (the `Without<Swinging>` filter).
+pub fn animate_throwing_action(
+    time: Res<Time>,
+    players: Query<(&mut ThrowingAnimation, &Children), With<ThrowingAnimation>>,
+    mut indicators: Query<&mut Transform, With<ThrowIndicator>>,
+) {
+
+    for (mut throwing, children) in players {
+        throwing.elapsed += time.delta_secs();
+        let progress = throwing.elapsed.clamp(0.0, 2.0) / 2.0;
+        let progress = -1.0 - progress;
+        for child in children {
+            if let Ok(mut transform) = indicators.get_mut(*child) {
+                transform.translation = Vec3 { x: 0.0, y: 0.0, z: progress};
+            }
+        }
     }
 }
 
@@ -1095,7 +1414,7 @@ pub fn detect_strikes(
     mut collisions: MessageReader<CollisionStart>,
     in_replay: Res<InReplay>,
     client: Res<GameClientWrapper>,
-    players: Query<(Entity, &PlayerId)>,
+    players: Query<(Entity, &PlayerId), (Without<Dying>, Without<Dead>)>,
     blades: Query<&ChildOf, With<BoomerangBlade>>,
     swinging: Query<(), With<Swinging>>,
     ticker: Res<Ticker>,
@@ -1136,7 +1455,6 @@ pub fn detect_strikes(
         if !local_ids.contains(&striker.1.player_id) {
             continue;
         }
-        println!("CollisionStart");
 
         let game_event = GameEffect::StrikePlayer {
             striker_id: striker.1.player_id,
@@ -1193,7 +1511,6 @@ pub fn detect_parries(
 
         for child in player_1.4.iter() {
             if let Ok((boomerang, mut transform)) = lobjects.get_mut(child) {
-                println!("Removing swinging from player_1 lobjects");
                 commands.entity(boomerang).remove::<Swinging>();
                 transform.translation = Vec3::ZERO;
                 transform.rotation = Quat::IDENTITY;
@@ -1204,7 +1521,6 @@ pub fn detect_parries(
 
         for child in player_2.4.iter() {
             if let Ok((boomerang, mut transform)) = lobjects.get_mut(child) {
-                println!("Removing swinging from player_2 lobjects");
                 commands.entity(boomerang).remove::<Swinging>();
                 transform.translation = Vec3::ZERO;
                 transform.rotation = Quat::IDENTITY;
@@ -1213,7 +1529,6 @@ pub fn detect_parries(
         record_game_effect(&in_replay, &client, &ticker, &mut sent_events, game_event.clone());
         *player_2.1 = LinearVelocity((player_2.5.translation - player_1.5.translation).normalize() * 5.0);
         *player_2.2 = ConstantLinearAcceleration(Vec3::ZERO);
-        println!("Parry: {:?} {:?}", player_1.1, player_2.1);
     }
 }
 
@@ -1246,7 +1561,6 @@ pub fn animate_death(mut commands: Commands, time: Res<Time>, mut query: Query<(
         dead.elapsed += time.delta_secs();
         let t = (dead.elapsed / DEATH_DURATION).clamp(0.0, 1.0);
         transform.scale = Vec3::splat(1.0 - t * (1.0 - DEAD_SCALE));
-        println!("{}: dead.elapsed: {}", player_id.player_id, dead.elapsed);
         if dead.elapsed >= DEATH_DURATION {
             commands.entity(player).remove::<Dying>();
             commands.entity(player).insert(Dead{});
@@ -1261,32 +1575,35 @@ pub fn animate_death(mut commands: Commands, time: Res<Time>, mut query: Query<(
 pub fn record_tick_state(
     mut ticker: ResMut<Ticker>,
     mut sent_events: ResMut<LocalGameEvents>,
-    player_query: Query<(&PlayerId, &Transform, &LinearVelocity, &Rotation, &ConstantLinearAcceleration, &Children, Option<&Dying>, Option<&Dead>)>,
+    player_query: Query<(&PlayerId, &Transform, &LinearVelocity, &Rotation, &ConstantLinearAcceleration, Option<&Children>, Option<&Dying>, Option<&Dead>, Option<&StartThrow>, Option<&ThrowingAnimation>)>,
     stationary_boomerangs: Query<&Boomerang, Without<Swinging>>,
     swinging_boomerangs: Query<(&Boomerang, &Swinging), With<Swinging>>,
+    thrown_boomerangs: Query<(&Boomerang, Option<&Thrown>, &LinearVelocity, &Transform, &ConstantLinearAcceleration), With<Thrown>>,
 ) {
     if ticker.1 {
-        // println!("Incrementing ticker state from: {}", ticker.0);
         ticker.0 += 1;
-        // println!("Incremented ticker state to: {}", ticker.1);
     } else {
         ticker.1 = true;
     }
+    if player_query.iter().len() == 0 {
+        panic!("No players at tick: {}", ticker.0);
+    }
     let game_state = GameState{
         players: player_query.iter()
-        .map(|(player, transform, velocity, rotation, acceleration, children, dying, dead)| {
+        .map(|(player, transform, velocity, rotation, acceleration, children, dying, dead, start_throw, throwing)| {
             let mut player_boomerang_stationary: Option<PlayerBoomerangState> = None;
-            for child in children {
-                if let Ok(_) = stationary_boomerangs.get(*child) {
-                    player_boomerang_stationary = Some(PlayerBoomerangState::Stationary);
-                    break;
-                }
-                if let Ok((_, swinging)) = swinging_boomerangs.get(*child) {
-                    player_boomerang_stationary = Some(PlayerBoomerangState::Swinging { elapsed: swinging.elapsed });
-                    break;
+            if let Some(children) = children {
+                for child in children {
+                    if let Ok(_) = stationary_boomerangs.get(*child) {
+                        player_boomerang_stationary = Some(PlayerBoomerangState::Stationary);
+                        break;
+                    }
+                    if let Ok((_, swinging)) = swinging_boomerangs.get(*child) {
+                        player_boomerang_stationary = Some(PlayerBoomerangState::Swinging { elapsed: swinging.elapsed });
+                        break;
+                    }
                 }
             }
-            // println!("Tick: {}, Recording: {:?}", ticker.0, transform.translation);
             PlayerState {
                 status: match dying {
                     Some(dead) => PlayerStatus::Dying { elapsed: dead.elapsed },
@@ -1299,21 +1616,32 @@ pub fn record_tick_state(
                 color: player.color,
                 position: transform.translation,
                 velocity: velocity.0,
-                rotation: rotation.0,
+                rotation: transform.rotation,
                 acceleration: acceleration.0,
                 bommerang: player_boomerang_stationary,
+                throwing_state: match start_throw {
+                    Some(start_throw) => Some(ThrowingState::StartThrow {}),
+                    None => match throwing {
+                        Some(throwing) => Some(ThrowingState::Throwing { elapsed: throwing.elapsed }),
+                        None => None,
+                    }
+                }
             }
         })
-        .collect()
+        .collect(),
+        thrown_boomerangs: vec![],
+        // thrown_boomerangs: thrown_boomerangs.iter().map(|thrown_boomerange| {
+        //     ThrownBoomerangeState {
+
+        //     }
+        // }),
     };
-    // println!("Adding player state for tick: {}", ticker.0);
     sent_events.add_state(TickRecord {
         tick: ticker.0,
         game_state: game_state,
         player_actions: BTreeSet::new(),
         game_effects: BTreeSet::new(),
     });
-    // println!("Added player state for tick: {}", ticker.0);
 }
 
 pub fn record_player_action(
@@ -1323,7 +1651,6 @@ pub fn record_player_action(
     player_action: &PlayerAction,
     send_to_server: bool,
 ) {
-    // println!("Recording player action with tick: {:?}", ticker.0);
     if let Some(sender) = &client.client.read().unwrap().sender {
         sent_events.insert_received_player_actions( vec![ (ticker.0, player_action.clone()) ]);
         if send_to_server {
@@ -1351,13 +1678,16 @@ pub fn record_game_effect(
     }
 }
 
-pub fn spawn_world(commands: &mut Commands, materials: &mut ResMut<Assets<StandardMaterial>>, meshes: &mut ResMut<Assets<Mesh>>, players: Query<Entity, With<PlayerId>>, game_state: GameState) {
+pub fn spawn_world(commands: &mut Commands, ticker: &Ticker, materials: &mut ResMut<Assets<StandardMaterial>>, meshes: &mut ResMut<Assets<Mesh>>, players: Query<Entity, With<PlayerId>>, game_state: GameState) {
     for player in players {
         commands.entity(player).despawn();
     }
     let l_spine_mesh = meshes.add(Cuboid::new(1.0, 0.1, 0.2));
     let l_foot_mesh = meshes.add(Cuboid::new(0.2, 0.1, 0.8));
     let l_material = materials.add(Color::srgb(0.7, 0.7, 0.7));
+    if game_state.players.is_empty() {
+        panic!("No players at {}", ticker.0);
+    }
     for player in game_state.players.clone() {
         let dying_scale = match player.status {
             PlayerStatus::Alive => 0.0,
@@ -1384,49 +1714,94 @@ pub fn spawn_world(commands: &mut Commands, materials: &mut ResMut<Assets<Standa
                 LinearVelocity(player.velocity),
                 PlayerId { player_id: player.player_id, color: player.color },
             ));
-        player_entity.with_children(|parent| {
-            // The L as a single entity, anchored at the point where it meets the
-            // cube (the right face, local x = 0.5). Its segments are positioned
-            // relative to this anchor.
-            let mut boomerang = parent.spawn((
-                Boomerang,
-                Transform::from_xyz(0.5, 0.0, 0.0),
-                Visibility::default(),
-            ));
-            // Restore an in-flight swing from the snapshot. `animate_swing` derives the
-            // boomerang transform entirely from `elapsed`, so the component alone is
-            // enough; the pose corrects itself on the next physics step.
-            if let Some(PlayerBoomerangState::Swinging { elapsed }) = player.bommerang {
-                boomerang.insert(Swinging { elapsed });
-            }
-            boomerang
-                .with_children(|l| {
-                    // L spine: runs along +X out from the anchor (cube right face).
-                    l.spawn((
-                        Mesh3d(l_spine_mesh.clone()),
-                        MeshMaterial3d(l_material.clone()),
-                        Transform::from_xyz(0.5, 0.0, 0.0),
-                        Collider::cuboid(1.0, 0.1, 0.2),
-                        BoomerangBlade,
-                        CollisionEventsEnabled,
-                    ));
-                    // L foot: turns in -Z at the outer end, forming the base of the L
-                    // (mirrored about the xy plane).
-                    l.spawn((
-                        Mesh3d(l_foot_mesh.clone()),
-                        MeshMaterial3d(l_material.clone()),
-                        Transform::from_xyz(0.9, 0.0, -0.3),
-                        Collider::cuboid(0.2, 0.1, 0.8),
-                        BoomerangBlade,
-                        CollisionEventsEnabled,
-                    ));
-                });
-        });
+        if let Some(boomerang_state) = player.bommerang {
+            player_entity.with_children(|parent| {
+                // The L as a single entity, anchored at the point where it meets the
+                // cube (the right face, local x = 0.5). Its segments are positioned
+                // relative to this anchor.
+                let mut boomerang = parent.spawn((
+                    Boomerang,
+                    Transform::from_xyz(0.5, 0.0, 0.0),
+                    Visibility::default(),
+                ));
+                // Restore an in-flight swing from the snapshot. `animate_swing` derives the
+                // boomerang transform entirely from `elapsed`, so the component alone is
+                // enough; the pose corrects itself on the next physics step.
+                if let Some(PlayerBoomerangState::Swinging { elapsed }) = player.bommerang {
+                    boomerang.insert(Swinging { elapsed });
+                }
+                boomerang
+                    .with_children(|l| {
+                        // L spine: runs along +X out from the anchor (cube right face).
+                        l.spawn((
+                            Mesh3d(l_spine_mesh.clone()),
+                            MeshMaterial3d(l_material.clone()),
+                            Transform::from_xyz(0.5, 0.0, 0.0),
+                            Collider::cuboid(1.0, 0.1, 0.2),
+                            BoomerangBlade,
+                            CollisionEventsEnabled,
+                        ));
+                        // L foot: turns in -Z at the outer end, forming the base of the L
+                        // (mirrored about the xy plane).
+                        l.spawn((
+                            Mesh3d(l_foot_mesh.clone()),
+                            MeshMaterial3d(l_material.clone()),
+                            Transform::from_xyz(0.9, 0.0, -0.3),
+                            Collider::cuboid(0.2, 0.1, 0.8),
+                            BoomerangBlade,
+                            CollisionEventsEnabled,
+                        ));
+                    });
+            });
+        }
         if let PlayerStatus::Dying { elapsed } = player.status {
             player_entity.insert(Dying{elapsed: elapsed});
         }
         if let PlayerStatus::Dead {} = player.status {
             player_entity.insert(Dead{});
+        }
+        if let Some(throwing_state) = player.throwing_state {
+            let l_spine_mesh = meshes.add(Cuboid::new(0.4, 0.1, 0.1));
+            let l_foot_mesh = meshes.add(Cuboid::new(0.1, 0.1, 0.5));
+            let l_material = materials.add(Color::srgb(0.7, 0.7, 0.7));
+            match throwing_state {
+                ThrowingState::StartThrow {} => {
+                    player_entity.insert(StartThrow {});
+                },
+                ThrowingState::Throwing { elapsed } => {
+                    player_entity.insert(ThrowingAnimation { elapsed });
+                },
+            };
+            player_entity.with_children(|parent| {
+                parent.spawn((
+                    ThrowIndicator,
+                    match throwing_state {
+                        ThrowingState::StartThrow {} => {
+                            Transform::from_xyz(0.0, 0.0, -1.0)
+                        },
+                        ThrowingState::Throwing { elapsed } => {
+                            let progress = elapsed.clamp(0.0, 2.0)/ 2.0;
+                            let progress = -1.0 - progress;
+                            Transform::from_xyz(0.0, 0.0, progress)
+                        }
+                    }.with_rotation(Quat::from_rotation_y(f32::atan2(-1.0, 1.0))),
+                ))
+                    .with_children(|l| {
+                        // L spine: runs along +X out from the anchor (cube right face).
+                        l.spawn((
+                            Mesh3d(l_spine_mesh.clone()),
+                            MeshMaterial3d(l_material.clone()),
+                            Transform::from_xyz(0.3, 0.0, 0.05),
+                        ));
+                        // L foot: turns in -Z at the outer end, forming the base of the L
+                        // (mirrored about the xy plane).
+                        l.spawn((
+                            Mesh3d(l_foot_mesh.clone()),
+                            MeshMaterial3d(l_material.clone()),
+                            Transform::from_xyz(0.05, 0.0, 0.25),
+                        ));
+                    });
+            });
         }
     }
 }
