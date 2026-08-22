@@ -63,7 +63,8 @@ pub struct ThrowingAnimation {
 enum GameLayer {
     #[default]
     Default,
-    Platform,
+    Environment,
+    Active,
     Dead,
 }
 
@@ -308,7 +309,7 @@ pub fn setup_game_play(
         RigidBody::Static,
         Collider::cuboid(20.0, 0.01, 20.0),
         // Own layer so dead bodies can filter to collide with only the platform.
-        CollisionLayers::new(GameLayer::Platform, LayerMask::ALL),
+        CollisionLayers::new(GameLayer::Environment, LayerMask::ALL),
         Friction {
             static_coefficient: 1.0,
             dynamic_coefficient: 1.0,
@@ -1489,7 +1490,7 @@ pub fn detect_throw_strikes(
     mut collisions: MessageReader<CollisionStart>,
     in_replay: Res<InReplay>,
     client: Res<GameClientWrapper>,
-    players: Query<&PlayerId>,
+    players: Query<(Entity, &PlayerId)>,
     blades: Query<&ChildOf, With<BoomerangBlade>>,
     thrown: Query<&Thrown, With<Thrown>>,
     ticker: Res<Ticker>,
@@ -1509,8 +1510,8 @@ pub fn detect_throw_strikes(
         let blade1 = blades.get(event.collider1).ok();
         let blade2 = blades.get(event.collider2).ok();
         let (blade_child_of, other_body) = match (blade1, blade2) {
-            (Some(c), None) => (c, event.collider2),
-            (None, Some(c)) => (c, event.collider1),
+            (Some(c), None) => (c, event.body2),
+            (None, Some(c)) => (c, event.body1),
             (None, None) => {
                 println!("Not the right objects: 1");
                 continue
@@ -1520,6 +1521,7 @@ pub fn detect_throw_strikes(
                 continue
             },
         };
+        let Some(other_body) = other_body else { continue };
 
         let Ok(blade) = thrown.get(blade_child_of.parent()) else {
             println!("Not the right objects: 2: {}", blade_child_of.parent().index());
@@ -1532,6 +1534,14 @@ pub fn detect_throw_strikes(
             continue
         };
 
+        let Some(player_id) = blade.player_id else {continue};
+
+        let game_event = GameEffect::StrikePlayer {
+            striker_id: player_id,
+            struck_id: player.1.player_id,
+        };
+        commands.entity(player.0).insert(Dying{elapsed: 0.0});
+        record_game_effect(&in_replay, &client, &ticker, &mut sent_events, game_event);
     }
 }
 
@@ -1611,7 +1621,7 @@ pub fn apply_dead_collision_layers(
     boomerangs: Query<&Children, With<Boomerang>>,
     mut commands: Commands,
 ) {
-    let dead_layers = CollisionLayers::new(GameLayer::Dead, GameLayer::Platform);
+    let dead_layers = CollisionLayers::new(GameLayer::Dead, GameLayer::Environment);
     for (body, children) in &newly_dead {
         commands.entity(body).insert(dead_layers);
         for &child in children {
@@ -1785,6 +1795,7 @@ pub fn spawn_world(commands: &mut Commands, ticker: &Ticker, materials: &mut Res
                 Transform::from_translation(player.position).with_rotation(player.rotation).with_scale(dying_scale),
                 RigidBody::Dynamic,
                 Collider::cylinder(0.5, 1.0),
+                CollisionLayers::new(GameLayer::Active, [GameLayer::Environment, GameLayer::Active]),
                 // Facing is driven manually (see `drain_server_events`); lock physics
                 // rotation so collisions don't tumble the cube and fight that facing.
                 LockedAxes::ROTATION_LOCKED,
@@ -1844,9 +1855,11 @@ pub fn spawn_world(commands: &mut Commands, ticker: &Ticker, materials: &mut Res
         }
         if let PlayerStatus::Dying { elapsed } = player.status {
             player_entity.insert(Dying{elapsed: elapsed});
+            player_entity.insert(CollisionLayers::new(GameLayer::Dead, GameLayer::Environment));
         }
         if let PlayerStatus::Dead {} = player.status {
             player_entity.insert(Dead{});
+            player_entity.insert(CollisionLayers::new(GameLayer::Dead, GameLayer::Environment));
         }
         if let Some(throwing_state) = player.throwing_state {
             let l_spine_mesh = meshes.add(Cuboid::new(0.4, 0.1, 0.1));
@@ -1944,6 +1957,7 @@ pub fn spawn_boomerang<'a>(
                 MeshMaterial3d(l_material.clone()),
                 Transform::from_xyz(0.25, 0.0, 0.0),
                 Collider::cuboid(0.5, 0.05, 0.1),
+                CollisionLayers::new(GameLayer::Active, [GameLayer::Environment, GameLayer::Active]),
                 BoomerangBlade,
                 CollisionEventsEnabled,
             ));
@@ -1955,6 +1969,7 @@ pub fn spawn_boomerang<'a>(
                 MeshMaterial3d(l_material_2.clone()),
                 Transform::from_xyz(0.45, 0.0, -0.25),
                 Collider::cuboid(0.1, 0.05, 0.4),
+                CollisionLayers::new(GameLayer::Active, [GameLayer::Environment, GameLayer::Active]),
                 BoomerangBlade,
                 CollisionEventsEnabled,
             ));
