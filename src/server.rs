@@ -144,11 +144,12 @@ pub struct PlayerState {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ThrownBoomerangeState {
-    pub player_id: u8,
+    pub player_id: Option<u8>,
     pub position: Vec3,
     pub velocity: Vec3,
     pub rotation: Quat,
     pub acceleration: Vec3,
+    pub angular_veloctiy: Vec3,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

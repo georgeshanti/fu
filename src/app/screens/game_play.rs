@@ -1,7 +1,7 @@
-use std::{collections::{BTreeMap, BTreeSet}, time::{Duration, SystemTime}};
+use std::{collections::{BTreeMap, BTreeSet}, f32::consts::PI, time::{Duration, SystemTime}};
 
 use avian3d::{prelude::*};
-use bevy::{ecs::{system::SystemState}, prelude::*};
+use bevy::{ecs::{relationship::RelatedSpawnerCommands, system::SystemState}, prelude::*};
 
 use crate::{
     app::{GameClientWrapper, screens::{app_state::AppState, lobby::PendingSpawns}}, server::{self, ClientEvent, Controller, GameEffect, GameState, OrderedF32, PlayerAction, PlayerBoomerangState, PlayerState, PlayerStatus, ServerEvent, ThrowingState, ThrownBoomerangeState},
@@ -281,10 +281,12 @@ pub fn setup_game_play(
     mut materials: ResMut<Assets<StandardMaterial>>,
     spawns: Option<Res<PendingSpawns>>,
     players: Query<Entity, With<PlayerId>>,
+    boomerangs: Query<Entity, (With<Boomerang>, With<Thrown>)>,
 ) {
     // Camera, positioned back and up, looking at the origin.
     commands.spawn((
         Camera3d::default(),
+        // Transform::from_xyz(0.0, 12.0, 0.0).looking_at(Vec3::ZERO, Vec3::Y),
         Transform::from_xyz(0.0, 5.0, 12.0).looking_at(Vec3::ZERO, Vec3::Y),
         GamePlayCamera,
     ));
@@ -333,7 +335,7 @@ pub fn setup_game_play(
             }
         }).collect(),
         thrown_boomerangs: vec![] };
-        spawn_world(&mut commands, &Ticker(0, false), &mut materials, &mut meshes, players, game_state);
+        spawn_world(&mut commands, &Ticker(0, false), &mut materials, &mut meshes, players, boomerangs, game_state);
         commands.insert_resource(PlayerInfos(spawns.0.iter().map(|player| { PlayerInfo { player_id: player.0.id, color: player.0.color, name: player.0.name.clone()} }).collect()));
     }
 
@@ -751,11 +753,12 @@ pub fn drain_server_events(
     mut params: Local<SystemState<(
         Commands,
         Res<GameClientWrapper>,
-        Query<(Entity, &PlayerId, &mut LinearVelocity, &mut ConstantLinearAcceleration, &mut Rotation, &mut Transform, Option<&Children>), Without<Dying>>,
-        Query<Entity, (With<Boomerang>, Without<Swinging>)>,
+        Query<(Entity, &PlayerId, &mut LinearVelocity, &mut ConstantLinearAcceleration, &mut Transform, Option<&Children>), (With<PlayerId>, Without<Dying>, Without<Boomerang>)>,
+        Query<(Entity, &Transform), (With<Boomerang>, Without<Swinging>)>,
         ResMut<Ticker>,
         ResMut<LocalGameEvents>,
         Query<Entity, With<PlayerId>>,
+        Query<Entity, (With<Boomerang>, With<Thrown>)>,
         ResMut<Assets<Mesh>>,
         ResMut<Assets<StandardMaterial>>,
         ResMut<InReplay>,
@@ -780,7 +783,7 @@ pub fn drain_server_events(
             ServerEvent::RoundEnded{ max, old_score, new_score} => {
                 // Leave the scene standing and hand over to `setup_round_ended`, which
                 // draws the result overlay on top of the now-frozen field.
-                let (mut commands, _, _, _, _, _, _, _, _, _, mut next_state) = params.get_mut(world);
+                let (mut commands, _, _, _, _, _, _, _, _, _, _, mut next_state) = params.get_mut(world);
                 commands.insert_resource(Score{time: SystemTime::now(), max, old_score, new_score, winners: vec![]});
                 next_state.set(AppState::RoundEndAnimation);
                 params.apply(world);
@@ -789,7 +792,7 @@ pub fn drain_server_events(
             ServerEvent::GameEnded{ max, old_score, new_score, game_winners} => {
                 // Leave the scene standing and hand over to `setup_round_ended`, which
                 // draws the result overlay on top of the now-frozen field.
-                let (mut commands, _, _, _, _, _, _, _, _, _, mut next_state) = params.get_mut(world);
+                let (mut commands, _, _, _, _, _, _, _, _, _, _, mut next_state) = params.get_mut(world);
                 commands.insert_resource(Score{time: SystemTime::now(), max, old_score, new_score, winners: game_winners.iter().map(|winner| {winner.id}).collect()});
                 next_state.set(AppState::RoundEndAnimation);
                 params.apply(world);
@@ -805,9 +808,9 @@ pub fn drain_server_events(
         };
         let mut existing_records = {
             let first_tick = new_player_actions.first().unwrap().0;
-            let (mut commands, _, _, _, mut ticker, mut local_game_events, players, mut meshes, mut materials, mut in_replay, _) = params.get_mut(world);
+            let (mut commands, _, _, _, mut ticker, mut local_game_events, players, boomerangs, mut meshes, mut materials, mut in_replay, _) = params.get_mut(world);
             let game_state = local_game_events.game_events.get(first_tick as usize).unwrap().game_state.clone();
-            spawn_world(&mut commands, &ticker, &mut materials, &mut meshes, players, game_state);
+            spawn_world(&mut commands, &ticker, &mut materials, &mut meshes, players, boomerangs, game_state);
             ticker.0 = first_tick;
             in_replay.0 = true;
             let existing_records = local_game_events.game_events[first_tick as usize..].to_vec();
@@ -821,13 +824,13 @@ pub fn drain_server_events(
         // despawn finally landed.
         params.apply(world);
         let mut current_tick = {
-            let (_, _, _, _, ticker, _, players, mut meshes, mut materials, mut in_replay, _) = params.get_mut(world);
+            let (_, _, _, _, ticker, _, players, _, mut meshes, mut materials, mut in_replay, _) = params.get_mut(world);
             ticker.0
         };
         while current_tick <= final_tick {
             {
                 while !new_player_actions.is_empty() && new_player_actions.first().unwrap().0 == current_tick {
-                    let (mut commands, client, mut query, lobjects, mut ticker, mut sent_events, _, _, _, _, _) =
+                    let (mut commands, client, mut query, lobjects, mut ticker, mut sent_events, _, _, _, _, _, _) =
                         params.get_mut(world);
                     let first = new_player_actions.first().unwrap();
                     {
@@ -852,7 +855,7 @@ pub fn drain_server_events(
             world.run_schedule(FixedPostUpdate);
             params.apply(world);
             if !existing_records.is_empty() {
-                let (_, client, _, _, _, mut local_game_events, _, _, _, _, _) = params.get_mut(world);
+                let (_, client, _, _, _, mut local_game_events, _, _, _, _, _, _) = params.get_mut(world);
                 let old_game_effects = existing_records.first().unwrap().game_effects.clone();
                 let new_game_effects = local_game_events.game_events.get(current_tick as usize).unwrap().game_effects.clone();
                 let missing_game_effects = new_game_effects.difference(&old_game_effects);
@@ -864,12 +867,12 @@ pub fn drain_server_events(
                 existing_records.remove(0);
             }
             current_tick = {
-                let (_, _, _, _, ticker, _, _, _, _, _, _) = params.get_mut(world);
+                let (_, _, _, _, ticker, _, _, _, _, _, _, _) = params.get_mut(world);
                 ticker.0
             };
         }
         {
-            let (_, _, _, _, _, _, _, _, _, mut in_replay, _) = params.get_mut(world);
+            let (_, _, _, _, _, _, _, _, _, _, mut in_replay, _) = params.get_mut(world);
             in_replay.0 = false;
         }
         {
@@ -892,22 +895,23 @@ fn apply_action_to_world(
     params: &mut Local<SystemState<(
         Commands,
         Res<GameClientWrapper>,
-        Query<(Entity, &PlayerId, &mut LinearVelocity, &mut ConstantLinearAcceleration, &mut Rotation, &mut Transform, Option<&Children>), Without<Dying>>,
-        Query<Entity, (With<Boomerang>, Without<Swinging>)>,
+        Query<(Entity, &PlayerId, &mut LinearVelocity, &mut ConstantLinearAcceleration, &mut Transform, Option<&Children>), (With<PlayerId>, Without<Dying>, Without<Boomerang>)>,
+        Query<(Entity, &Transform), (With<Boomerang>, Without<Swinging>)>,
         ResMut<Ticker>,
         ResMut<LocalGameEvents>,
         Query<Entity, With<PlayerId>>,
+        Query<Entity, (With<Boomerang>, With<Thrown>)>,
         ResMut<Assets<Mesh>>,
         ResMut<Assets<StandardMaterial>>,
         ResMut<InReplay>,
         ResMut<NextState<AppState>>,
     )>>,
 ) {
-    let (mut commands, client, mut query, lobjects, mut ticker, mut sent_events, _, _, _, _, _) =
+    let (mut commands, client, mut query, lobjects, mut ticker, mut sent_events, _, _, _, _, _, _) =
         params.get_mut(world);
     match player_action {
         PlayerAction::Movement { player_id, x, y } => {
-            for (_entity, player, mut vel, mut accel, mut rotation, mut transform, _) in &mut query {
+            for (_entity, player, mut vel, mut accel, mut transform, _) in &mut query {
                 if player.player_id == *player_id {
                     vel.x = x.0;
                     vel.z = y.0;
@@ -923,18 +927,17 @@ fn apply_action_to_world(
                     // against the stale `Transform` and clobber the new facing.
                     if Vec3::new(x.0, 0.0, y.0).length_squared() > 1e-6 {
                         let yaw = Quat::from_rotation_y(f32::atan2(-x.0, -y.0));
-                        *rotation = yaw.into();
                         transform.rotation = yaw;
                     }
                 }
             }
         },
         PlayerAction::Swing { player_id } => {
-            for (_entity, entity_player_id, mut vel, mut accel, mut rotation, mut transform, children) in &mut query {
+            for (_entity, entity_player_id, mut vel, mut accel, mut transform, children) in &mut query {
                 if entity_player_id.player_id != *player_id { continue; }
                 if let Some(children) = children {
                     for child in children.iter() {
-                        if let Ok(boomerang) = lobjects.get(child) {
+                        if let Ok((boomerang, _)) = lobjects.get(child) {
                             *vel = LinearVelocity(Vec3::ZERO);
                             *accel = ConstantLinearAcceleration(Vec3::ZERO);
                             commands.entity(boomerang).insert(Swinging { elapsed: 0.0 });
@@ -944,7 +947,7 @@ fn apply_action_to_world(
             }
         }
         PlayerAction::Jump { player_id, x, y } => {
-            for (_entity, player, mut vel, mut accel, mut rotation, mut transform, _) in &mut query {
+            for (_entity, player, mut vel, mut accel, mut transform, _) in &mut query {
                 if player.player_id == *player_id {
                     vel.x = x.0;
                     vel.z = y.0;
@@ -952,14 +955,13 @@ fn apply_action_to_world(
                     *accel = ConstantLinearAcceleration(Vec3::ZERO);
                     if Vec3::new(x.0, 0.0, y.0).length_squared() > 1e-6 {
                         let yaw = Quat::from_rotation_y(f32::atan2(-x.0, -y.0));
-                        *rotation = yaw.into();
                         transform.rotation = yaw;
                     }
                 }
             }
         },
         PlayerAction::StartingThrowing { player_id, x, y } => {
-            for (_entity, player, mut vel, mut accel, mut rotation, mut transform, children) in &mut query {
+            for (_entity, player, mut vel, mut accel, mut transform, children) in &mut query {
                 if player.player_id == *player_id {
                     vel.x = 0.0;
                     vel.z = 0.0;
@@ -967,7 +969,6 @@ fn apply_action_to_world(
                     *accel = ConstantLinearAcceleration(Vec3::ZERO);
                     if Vec3::new(x.0, 0.0, y.0).length_squared() > 1e-6 {
                         let yaw = Quat::from_rotation_y(f32::atan2(-x.0, -y.0));
-                        *rotation = yaw.into();
                         transform.rotation = yaw;
                     }
                     let lobject_children: Vec<Entity> = if let Some(children) = children {
@@ -983,17 +984,30 @@ fn apply_action_to_world(
         },
         PlayerAction::ReleaseThrow { player_id, power, x, y } => {
             println!("Got release throw event");
-            for (_entity, player, mut vel, mut accel, mut rotation, mut transform, children) in &mut query {
+            for (_entity, player, mut vel, mut accel, mut player_transform, children) in &mut query {
                 if player.player_id == *player_id {
                     commands.entity(_entity).remove::<ThrowingAnimation>();
                     if let Some(children) = children {
                         for child in children {
-                            if let Ok(boomrang) = lobjects.get(*child) {
-                                println!("Has boomerang child: {}", ticker.0);
+                            if let Ok((boomrang, transform)) = lobjects.get(*child) {
+                                let direction_vector = Vec3{x: x.0, y: 0.0, z: y.0}.normalize_or(Vec3 { x: 0.0, y: 0.0, z: -1.0 });
+                                let new_origin_point = player_transform.translation + direction_vector * 1.0;
+                                let offset_translation = Quat::from_rotation_y(PI/2.0).mul_vec3(direction_vector) * 0.5;
+                                let mut new_transform = Transform::from_translation(new_origin_point + offset_translation).with_rotation(player_transform.rotation);
+                                new_transform.rotate_around(new_origin_point, Quat::from_rotation_y(3.0*PI/4.0));
+                                // let mut new_transform = Vec3{x:-0.5, y:0.0, z: -0.25});
+                                // new_transform.rotate_around(new_transform.translation + Vec3{x: 0.5, y: 0.0, z: 0.0}, Quat::from_rotation_y(3.0*PI/4.0));
+                                let velocity = LinearVelocity::from(Vec3{x: x.0, y: 0.0, z: y.0}.normalize_or_zero() * (4.0 + (power.0 * 8.0)));
+                                let angular_velocity = AngularVelocity(Vec3{x:0.0, y:8.0, z:0.0});
+                                println!("Transform: {:?}", new_transform);
+                                println!("Velocity: {:?}", velocity);
                                 commands.entity(_entity).detach_child(boomrang);
                                 commands.entity(boomrang).insert((
-                                    LinearVelocity::from(Vec3{x:x.0, y: 0.0, z: y.0}.normalize_or_zero() * power.0),
+                                    velocity,
                                     Thrown{player_id: Some(*player_id)},
+                                    new_transform,
+                                    angular_velocity,
+                                    RigidBody::Dynamic,
                                 ));
                             }
                         }
@@ -1409,7 +1423,7 @@ pub fn animate_swing(
 /// reports each collider's rigid body, so the blade's body is the striker and the other
 /// body is the struck player. Only the client that owns the striker sends the event, so
 /// the server sees one `StrikePlayer` per strike rather than one per simulating client.
-pub fn detect_strikes(
+pub fn detect_swing_strikes(
     mut commands: Commands,
     mut collisions: MessageReader<CollisionStart>,
     in_replay: Res<InReplay>,
@@ -1462,6 +1476,62 @@ pub fn detect_strikes(
         };
         commands.entity(struck.0).insert(Dying{elapsed: 0.0});
         record_game_effect(&in_replay, &client, &ticker, &mut sent_events, game_event);
+    }
+}
+
+/// Detects boomerang strikes. While a boomerang is mid-swing, a contact between one of
+/// its blade segments and another player's body is a strike. `CollisionStart` already
+/// reports each collider's rigid body, so the blade's body is the striker and the other
+/// body is the struck player. Only the client that owns the striker sends the event, so
+/// the server sees one `StrikePlayer` per strike rather than one per simulating client.
+pub fn detect_throw_strikes(
+    mut commands: Commands,
+    mut collisions: MessageReader<CollisionStart>,
+    in_replay: Res<InReplay>,
+    client: Res<GameClientWrapper>,
+    players: Query<&PlayerId>,
+    blades: Query<&ChildOf, With<BoomerangBlade>>,
+    thrown: Query<&Thrown, With<Thrown>>,
+    ticker: Res<Ticker>,
+    mut sent_events: ResMut<LocalGameEvents>,
+) {
+    // Snapshot which player ids this client controls locally.
+    let local_ids: Vec<u8> = {
+        let client = client.client.read().unwrap();
+        let players = client.players.read().unwrap();
+        players.iter().map(|p| p.id).collect()
+    };
+
+    for event in collisions.read() {
+        println!("Detected collision");
+        // Exactly one collider must be a blade. Neither -> a body-to-body bump;
+        // both -> boomerang vs boomerang. Neither is a strike.
+        let blade1 = blades.get(event.collider1).ok();
+        let blade2 = blades.get(event.collider2).ok();
+        let (blade_child_of, other_body) = match (blade1, blade2) {
+            (Some(c), None) => (c, event.collider2),
+            (None, Some(c)) => (c, event.collider1),
+            (None, None) => {
+                println!("Not the right objects: 1");
+                continue
+            },
+            (Some(_), Some(_)) => {
+                println!("Not the right objects: 1.5");
+                continue
+            },
+        };
+
+        let Ok(blade) = thrown.get(blade_child_of.parent()) else {
+            println!("Not the right objects: 2: {}", blade_child_of.parent().index());
+            continue
+        };
+        println!("Collided blade entity id: {}", blade_child_of.parent().index());
+        println!("Players: {}", players.iter().len());
+        let Ok(player) = players.get(other_body) else {
+            println!("Not the right objects: 2.5: {}", other_body);
+            continue
+        };
+
     }
 }
 
@@ -1575,10 +1645,10 @@ pub fn animate_death(mut commands: Commands, time: Res<Time>, mut query: Query<(
 pub fn record_tick_state(
     mut ticker: ResMut<Ticker>,
     mut sent_events: ResMut<LocalGameEvents>,
-    player_query: Query<(&PlayerId, &Transform, &LinearVelocity, &Rotation, &ConstantLinearAcceleration, Option<&Children>, Option<&Dying>, Option<&Dead>, Option<&StartThrow>, Option<&ThrowingAnimation>)>,
+    player_query: Query<(&PlayerId, &Transform, &LinearVelocity, &ConstantLinearAcceleration, Option<&Children>, Option<&Dying>, Option<&Dead>, Option<&StartThrow>, Option<&ThrowingAnimation>)>,
     stationary_boomerangs: Query<&Boomerang, Without<Swinging>>,
     swinging_boomerangs: Query<(&Boomerang, &Swinging), With<Swinging>>,
-    thrown_boomerangs: Query<(&Boomerang, Option<&Thrown>, &LinearVelocity, &Transform, &ConstantLinearAcceleration), With<Thrown>>,
+    thrown_boomerangs: Query<(&Boomerang, &Thrown, Option<&LinearVelocity>, Option<&Transform>, Option<&ConstantLinearAcceleration>, Option<&AngularVelocity>), With<Thrown>>,
 ) {
     if ticker.1 {
         ticker.0 += 1;
@@ -1590,7 +1660,7 @@ pub fn record_tick_state(
     }
     let game_state = GameState{
         players: player_query.iter()
-        .map(|(player, transform, velocity, rotation, acceleration, children, dying, dead, start_throw, throwing)| {
+        .map(|(player, transform, velocity, acceleration, children, dying, dead, start_throw, throwing)| {
             let mut player_boomerang_stationary: Option<PlayerBoomerangState> = None;
             if let Some(children) = children {
                 for child in children {
@@ -1629,12 +1699,17 @@ pub fn record_tick_state(
             }
         })
         .collect(),
-        thrown_boomerangs: vec![],
-        // thrown_boomerangs: thrown_boomerangs.iter().map(|thrown_boomerange| {
-        //     ThrownBoomerangeState {
-
-        //     }
-        // }),
+        // thrown_boomerangs: vec![],
+        thrown_boomerangs: thrown_boomerangs.iter().map(|(boomerang, thrown, linear_velocity, transform, acceleration, angular_velocity)| {
+            ThrownBoomerangeState {
+                player_id: thrown.player_id,
+                position: transform.map_or_else(|| { Vec3::ZERO }, |transform| {transform.translation}),
+                velocity: linear_velocity.map_or_else(|| { Vec3::ZERO }, |linear_velocity| {linear_velocity.0}),
+                rotation: transform.map_or_else(|| { Quat::IDENTITY }, |transform| {transform.rotation}),
+                acceleration: acceleration.map_or_else(|| { Vec3::ZERO }, |acceleration| {acceleration.0}),
+                angular_veloctiy: angular_velocity.map_or_else(|| { Vec3::ZERO }, |angular_velocity| {angular_velocity.0}),
+            }
+        }).collect(),
     };
     sent_events.add_state(TickRecord {
         tick: ticker.0,
@@ -1678,9 +1753,12 @@ pub fn record_game_effect(
     }
 }
 
-pub fn spawn_world(commands: &mut Commands, ticker: &Ticker, materials: &mut ResMut<Assets<StandardMaterial>>, meshes: &mut ResMut<Assets<Mesh>>, players: Query<Entity, With<PlayerId>>, game_state: GameState) {
+pub fn spawn_world(commands: &mut Commands, ticker: &Ticker, materials: &mut ResMut<Assets<StandardMaterial>>, meshes: &mut ResMut<Assets<Mesh>>, players: Query<Entity, With<PlayerId>>, boomerangs: Query<Entity, (With<Boomerang>, With<Thrown>)>, game_state: GameState) {
     for player in players {
         commands.entity(player).despawn();
+    }
+    for boomerangs in boomerangs {
+        commands.entity(boomerangs).despawn();
     }
     let l_spine_mesh = meshes.add(Cuboid::new(1.0, 0.1, 0.2));
     let l_foot_mesh = meshes.add(Cuboid::new(0.2, 0.1, 0.8));
@@ -1700,7 +1778,7 @@ pub fn spawn_world(commands: &mut Commands, ticker: &Ticker, materials: &mut Res
         let mut player_entity = commands
             .spawn((
                 Mesh3d(meshes.add(Cylinder::new(0.5, 1.0))),
-                MeshMaterial3d(materials.add(Color::srgb(player.color.red as f32 / 256.0, player.color.green as f32 / 256.0, player.color.blue as f32 / 256.0))),
+                MeshMaterial3d(materials.add(Color::srgba(player.color.red as f32 / 256.0, player.color.green as f32 / 256.0, player.color.blue as f32 / 256.0, 0.5))),
                 // NB: `.rotate()` mutates and returns `()` (which is a valid empty Bundle,
                 // so it compiles but silently inserts no Transform at all) — the builder
                 // form `.with_rotation()` is required here.
@@ -1714,44 +1792,54 @@ pub fn spawn_world(commands: &mut Commands, ticker: &Ticker, materials: &mut Res
                 LinearVelocity(player.velocity),
                 PlayerId { player_id: player.player_id, color: player.color },
             ));
+        println!("Player entity id: {}", player_entity.id().index());
         if let Some(boomerang_state) = player.bommerang {
             player_entity.with_children(|parent| {
                 // The L as a single entity, anchored at the point where it meets the
                 // cube (the right face, local x = 0.5). Its segments are positioned
                 // relative to this anchor.
-                let mut boomerang = parent.spawn((
+                // let mut boomerang = parent.spawn((
+                //     Boomerang,
+                //     Transform::from_xyz(0.5, 0.0, 0.0),
+                //     Visibility::default(),
+                // ));
+                let mut boomerang: EntityCommands<'_> = parent.spawn((
                     Boomerang,
-                    Transform::from_xyz(0.5, 0.0, 0.0),
                     Visibility::default(),
                 ));
+                println!("Boomerang id: {}", boomerang.id().index());
                 // Restore an in-flight swing from the snapshot. `animate_swing` derives the
                 // boomerang transform entirely from `elapsed`, so the component alone is
                 // enough; the pose corrects itself on the next physics step.
+                boomerang.insert(
+            Transform::from_xyz(0.5, 0.0, 0.0),
+                );
+                spawn_boomerang(&mut boomerang, materials, meshes);
                 if let Some(PlayerBoomerangState::Swinging { elapsed }) = player.bommerang {
                     boomerang.insert(Swinging { elapsed });
                 }
-                boomerang
-                    .with_children(|l| {
-                        // L spine: runs along +X out from the anchor (cube right face).
-                        l.spawn((
-                            Mesh3d(l_spine_mesh.clone()),
-                            MeshMaterial3d(l_material.clone()),
-                            Transform::from_xyz(0.5, 0.0, 0.0),
-                            Collider::cuboid(1.0, 0.1, 0.2),
-                            BoomerangBlade,
-                            CollisionEventsEnabled,
-                        ));
-                        // L foot: turns in -Z at the outer end, forming the base of the L
-                        // (mirrored about the xy plane).
-                        l.spawn((
-                            Mesh3d(l_foot_mesh.clone()),
-                            MeshMaterial3d(l_material.clone()),
-                            Transform::from_xyz(0.9, 0.0, -0.3),
-                            Collider::cuboid(0.2, 0.1, 0.8),
-                            BoomerangBlade,
-                            CollisionEventsEnabled,
-                        ));
-                    });
+                // boomerang
+                //     .with_children(|l| {
+                //         // L spine: runs along +X out from the anchor (cube right face).
+                //         l.spawn((
+                //             Mesh3d(l_spine_mesh.clone()),
+                //             MeshMaterial3d(l_material.clone()),
+                //             Transform::from_xyz(0.5, 0.0, 0.0),
+                //             Collider::cuboid(1.0, 0.1, 0.2),
+                //             BoomerangBlade,
+                //             CollisionEventsEnabled,
+                //         ));
+                //         // L foot: turns in -Z at the outer end, forming the base of the L
+                //         // (mirrored about the xy plane).
+                //         l.spawn((
+                //             Mesh3d(l_foot_mesh.clone()),
+                //             MeshMaterial3d(l_material.clone()),
+                //             Transform::from_xyz(0.9, 0.0, -0.3),
+                //             Collider::cuboid(0.2, 0.1, 0.8),
+                //             BoomerangBlade,
+                //             CollisionEventsEnabled,
+                //         ));
+                //     });
             });
         }
         if let PlayerStatus::Dying { elapsed } = player.status {
@@ -1773,7 +1861,7 @@ pub fn spawn_world(commands: &mut Commands, ticker: &Ticker, materials: &mut Res
                 },
             };
             player_entity.with_children(|parent| {
-                parent.spawn((
+                let mut indicator = parent.spawn((
                     ThrowIndicator,
                     match throwing_state {
                         ThrowingState::StartThrow {} => {
@@ -1785,25 +1873,93 @@ pub fn spawn_world(commands: &mut Commands, ticker: &Ticker, materials: &mut Res
                             Transform::from_xyz(0.0, 0.0, progress)
                         }
                     }.with_rotation(Quat::from_rotation_y(f32::atan2(-1.0, 1.0))),
-                ))
+                ));
+                indicator
                     .with_children(|l| {
                         // L spine: runs along +X out from the anchor (cube right face).
-                        l.spawn((
+                        let arrow_edge = l.spawn((
                             Mesh3d(l_spine_mesh.clone()),
                             MeshMaterial3d(l_material.clone()),
                             Transform::from_xyz(0.3, 0.0, 0.05),
                         ));
+                        println!("Arrow edge spawned: {}", arrow_edge.id().index());
                         // L foot: turns in -Z at the outer end, forming the base of the L
                         // (mirrored about the xy plane).
-                        l.spawn((
+                        let arrow_edge = l.spawn((
                             Mesh3d(l_foot_mesh.clone()),
                             MeshMaterial3d(l_material.clone()),
                             Transform::from_xyz(0.05, 0.0, 0.25),
                         ));
+                        println!("Arrow edge spawned: {}", arrow_edge.id().index());
                     });
+                println!("Indicator spawned: {}", indicator.id().index());
             });
         }
     }
+    for thrown_boomerang in game_state.thrown_boomerangs {
+        let mut boomerang = commands.spawn((
+            Boomerang,
+            Visibility::default(),
+        ));
+        println!("Boomerang id: {}", boomerang.id().index());
+        boomerang.insert((
+            Thrown{player_id: thrown_boomerang.player_id},
+            Transform::from_translation(thrown_boomerang.position).with_rotation(thrown_boomerang.rotation),
+            LinearVelocity(thrown_boomerang.velocity),
+            ConstantLinearAcceleration(thrown_boomerang.acceleration),
+            AngularVelocity(thrown_boomerang.angular_veloctiy),
+            RigidBody::Dynamic,
+        ));
+        spawn_boomerang(
+            &mut boomerang,
+            materials,
+            meshes,
+        );
+    }
+}
+
+pub fn spawn_boomerang<'a>(
+    boomerang: &'a mut EntityCommands,
+    materials: &mut ResMut<Assets<StandardMaterial>>,
+    meshes: &mut ResMut<Assets<Mesh>>,
+) {
+    let l_spine_mesh = meshes.add(Cuboid::new(0.5, 0.05, 0.1));
+    let l_foot_mesh = meshes.add(Cuboid::new(0.1, 0.05, 0.4));
+    let l_material = materials.add(Color::srgb(0.7, 0.7, 0.7));
+    let l_material_2 = materials.add(Color::srgb(0.7, 1.0, 0.7));
+    // The L as a single entity, anchored at the point where it meets the
+    // cube (the right face, local x = 0.5). Its segments are positioned
+    // relative to this anchor.
+    // Restore an in-flight swing from the snapshot. `animate_swing` derives the
+    // boomerang transform entirely from `elapsed`, so the component alone is
+    // enough; the pose corrects itself on the next physics step.
+    // if let Some(PlayerBoomerangState::Swinging { elapsed }) = player.bommerang {
+    //     boomerang.insert(Swinging { elapsed });
+    // }
+    boomerang
+        .with_children(|l| {
+            // L spine: runs along +X out from the anchor (cube right face).
+            let boomerang_blade = l.spawn((
+                Mesh3d(l_spine_mesh.clone()),
+                MeshMaterial3d(l_material.clone()),
+                Transform::from_xyz(0.25, 0.0, 0.0),
+                Collider::cuboid(0.5, 0.05, 0.1),
+                BoomerangBlade,
+                CollisionEventsEnabled,
+            ));
+            println!("BoomerangBlade spawned: {}", boomerang_blade.id().index());
+            // L foot: turns in -Z at the outer end, forming the base of the L
+            // (mirrored about the xy plane).
+            let boomerang_blade = l.spawn((
+                Mesh3d(l_foot_mesh.clone()),
+                MeshMaterial3d(l_material_2.clone()),
+                Transform::from_xyz(0.45, 0.0, -0.25),
+                Collider::cuboid(0.1, 0.05, 0.4),
+                BoomerangBlade,
+                CollisionEventsEnabled,
+            ));
+            println!("BoomerangBlade spawned: {}", boomerang_blade.id().index());
+        });
 }
 
 // pub fn get_new_actions(params: &mut Local<SystemState<(
