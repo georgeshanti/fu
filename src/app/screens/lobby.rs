@@ -2,9 +2,7 @@ use bevy::prelude::*;
 
 use crate::{
     app::{
-        GameClientWrapper,
-        common::text::{InputField, InputText, TextInputFocused},
-        screens::app_state::AppState,
+        GameClientWrapper, common::text::{InputField, InputText, TextInputFocused}, screens::{app_state::AppState, game_play::state::PendingSpawns},
     }, client::ClientPlayer, server::{self, ClientEvent, Controller, Player, ServerEvent},
 };
 
@@ -28,11 +26,6 @@ const SWATCH_RING_SELECTED: Color = Color::WHITE;
 /// …and around every other one: invisible, but it keeps all swatches the same
 /// size so the row doesn't reflow when the selection moves.
 const SWATCH_RING_UNSELECTED: Color = Color::NONE;
-
-/// Spawn assignments delivered by the server's `StartRound`, handed off to the
-/// `SpawningPlayers` state. Inserted by `update_lobby`; consumed by the spawning screen.
-#[derive(Resource)]
-pub struct PendingSpawns(pub Vec<(Player, Vec3)>);
 
 /// Marks the root UI node of the lobby screen, so it can be despawned on exit.
 #[derive(Component)]
