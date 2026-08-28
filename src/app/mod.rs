@@ -9,34 +9,15 @@ use bevy::prelude::*;
 use crate::app::screens::app_state::*;
 use crate::app::common::text::*;
 use crate::app::screens::game_menu::*;
-use crate::app::screens::game_play::actions::apply_dead_collision_layers;
-use crate::app::screens::game_play::actions::drain_server_events;
-use crate::app::screens::game_play::actions::move_player;
-use crate::app::screens::game_play::actions::release_throw;
-use crate::app::screens::game_play::actions::start_jump;
-use crate::app::screens::game_play::actions::start_swing;
-use crate::app::screens::game_play::actions::start_throwing;
-use crate::app::screens::game_play::animations::animate_death;
-use crate::app::screens::game_play::animations::animate_swing;
-use crate::app::screens::game_play::animations::animate_throwing_action;
-use crate::app::screens::game_play::animations::start_throw_animation;
-use crate::app::screens::game_play::detect_events::detect_parries;
-use crate::app::screens::game_play::detect_events::detect_swing_strikes;
-use crate::app::screens::game_play::detect_events::detect_throw_strikes;
-use crate::app::screens::game_play::phases::end::animate_round_end;
-use crate::app::screens::game_play::phases::end::cleanup_round_ended;
-use crate::app::screens::game_play::phases::end::handle_continue_button;
-use crate::app::screens::game_play::phases::end::setup_round_ended;
-use crate::app::screens::game_play::phases::end::start_round_end_animation;
-use crate::app::screens::game_play::phases::end::wait_for_next_round;
-use crate::app::screens::game_play::state::record_tick_state;
-use crate::app::screens::game_play::world::setup_game_play;
-use crate::app::screens::game_play::world::tick_countdown;
-use crate::app::screens::game_play::world::wait_for_start;
-use crate::app::screens::game_play::*;
+use crate::app::screens::game_play::actions::*;
+use crate::app::screens::game_play::animations::*;
+use crate::app::screens::game_play::detect_events::*;
+use crate::app::screens::game_play::phases::end::*;
+use crate::app::screens::game_play::state::*;
+use crate::app::screens::game_play::world::*;
 use crate::app::screens::join_game::*;
 use crate::app::screens::lobby::*;
-use crate::{client::GameClient, server::{ClientEvent, ServerEvent}};
+use crate::{client::GameClient};
 
 #[derive(Resource)]
 pub struct GameClientWrapper {
@@ -98,10 +79,12 @@ pub fn run() {
             (
                 start_jump,
                 start_swing,
-                move_player,
+                detect_player_movement,
                 apply_dead_collision_layers,
                 animate_death,
                 start_throwing,
+                start_pullback,
+                stop_pullback,
                 start_throw_animation,
                 animate_throwing_action,
                 release_throw,
@@ -111,6 +94,13 @@ pub fn run() {
         .add_systems(
             PhysicsSchedule,
             (
+                stop_pulling_boomerang.before(pull_boomerang),
+                pull_boomerang.before(release_boomerang),
+                release_boomerang.before(wind_up_boomerang),
+                wind_up_boomerang.before(jump_player),
+                jump_player.before(swing_boomerang),
+                swing_boomerang.before(move_player),
+                move_player.before(detect_throw_strikes),
                 detect_throw_strikes.before(detect_parries),
                 detect_parries.before(animate_swing),
                 animate_swing.before(detect_swing_strikes),

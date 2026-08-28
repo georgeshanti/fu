@@ -222,6 +222,8 @@ pub enum PlayerAction {
     StartingThrowing { player_id: u8, x: OrderedF32, y: OrderedF32  },
     // TurnThrow { player_id: u8, x: OrderedF32, y: OrderedF32  },
     ReleaseThrow { player_id: u8, power: OrderedF32, x: OrderedF32, y: OrderedF32  },
+    StartingPulling { player_id: u8 },
+    StoppingPulling { player_id: u8 },
 }
 
 #[derive(Event, Debug, Clone, Serialize, Deserialize, PartialEq, PartialOrd, Eq, Ord)]

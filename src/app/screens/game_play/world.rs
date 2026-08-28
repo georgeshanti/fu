@@ -1,9 +1,9 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use avian3d::prelude::*;
 use bevy::prelude::*;
 
-use crate::{app::{GameClientWrapper, screens::{app_state::AppState, game_play::{actions::{PlayerDirections, PlayerJumpCooldowns, PlayerSwingCooldowns, StartThrow}, animations::{DEAD_SCALE, DEATH_DURATION, Dying, Swinging, ThrowIndicator, ThrowingAnimation}, entities::boomerang::{Boomerang, Thrown, spawn_boomerang}, phases::end::{CountdownOverlay, CountdownText}, state::{Countdown, Dead, InReplay, LocalGameEvents, PendingSpawns, PlayerId, PlayerInfo, PlayerInfos, Ticker}}}}, server::{ClientEvent, GameState, PlayerBoomerangState, PlayerState, PlayerStatus, ServerEvent, ThrowingState}};
+use crate::{app::{GameClientWrapper, screens::{app_state::AppState, game_play::{actions::{PlayerActions, PlayerDirections, PlayerJumpCooldowns, PlayerSwingCooldowns, PlayersPulling, StartThrow}, animations::{DEAD_SCALE, DEATH_DURATION, Dying, Swinging, ThrowIndicator, ThrowingAnimation}, entities::boomerang::{Boomerang, Thrown, spawn_boomerang}, phases::end::{CountdownOverlay, CountdownText}, state::{Countdown, Dead, InReplay, LocalGameEvents, PendingSpawns, PlayerId, PlayerInfo, PlayerInfos, Ticker}}}}, server::{ClientEvent, GameState, PlayerBoomerangState, PlayerState, PlayerStatus, ServerEvent, ThrowingState}};
 
 /// Seconds to wait (showing the countdown overlay) before telling the server we're ready.
 const COUNTDOWN_SECS: f32 = 3.0;
@@ -170,7 +170,6 @@ pub fn spawn_world(commands: &mut Commands, ticker: &Ticker, materials: &mut Res
                 LinearVelocity(player.velocity),
                 PlayerId { player_id: player.player_id, color: player.color },
             ));
-        println!("Player entity id: {}", player_entity.id().index());
         if let Some(boomerang_state) = player.bommerang {
             player_entity.with_children(|parent| {
                 // The L as a single entity, anchored at the point where it meets the
@@ -185,7 +184,6 @@ pub fn spawn_world(commands: &mut Commands, ticker: &Ticker, materials: &mut Res
                     Boomerang,
                     Visibility::default(),
                 ));
-                println!("Boomerang id: {}", boomerang.id().index());
                 // Restore an in-flight swing from the snapshot. `animate_swing` derives the
                 // boomerang transform entirely from `elapsed`, so the component alone is
                 // enough; the pose corrects itself on the next physics step.
@@ -262,7 +260,6 @@ pub fn spawn_world(commands: &mut Commands, ticker: &Ticker, materials: &mut Res
                             MeshMaterial3d(l_material.clone()),
                             Transform::from_xyz(0.3, 0.0, 0.05),
                         ));
-                        println!("Arrow edge spawned: {}", arrow_edge.id().index());
                         // L foot: turns in -Z at the outer end, forming the base of the L
                         // (mirrored about the xy plane).
                         let arrow_edge = l.spawn((
@@ -270,9 +267,7 @@ pub fn spawn_world(commands: &mut Commands, ticker: &Ticker, materials: &mut Res
                             MeshMaterial3d(l_material.clone()),
                             Transform::from_xyz(0.05, 0.0, 0.25),
                         ));
-                        println!("Arrow edge spawned: {}", arrow_edge.id().index());
                     });
-                println!("Indicator spawned: {}", indicator.id().index());
             });
         }
     }
@@ -281,7 +276,7 @@ pub fn spawn_world(commands: &mut Commands, ticker: &Ticker, materials: &mut Res
             Boomerang,
             Visibility::default(),
         ));
-        println!("Boomerang id: {}", boomerang.id().index());
+        println!("With acceleration: {}", thrown_boomerang.acceleration);
         boomerang.insert((
             Thrown{player_id: thrown_boomerang.player_id},
             Transform::from_translation(thrown_boomerang.position).with_rotation(thrown_boomerang.rotation),
@@ -353,8 +348,10 @@ pub fn wait_for_start(
             commands.insert_resource(LocalGameEvents::default());
             commands.insert_resource(InReplay::default());
             commands.insert_resource(PlayerDirections(BTreeMap::new()));
+            commands.insert_resource(PlayersPulling(BTreeSet::new()));
             commands.insert_resource(PlayerJumpCooldowns(BTreeMap::new()));
             commands.insert_resource(PlayerSwingCooldowns(BTreeMap::new()));
+            commands.insert_resource(PlayerActions{actions: vec![]});
             next_state.set(AppState::Playing);
         }
     }

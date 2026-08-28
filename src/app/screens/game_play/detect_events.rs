@@ -76,7 +76,7 @@ pub fn detect_throw_strikes(
     client: Res<GameClientWrapper>,
     players: Query<(Entity, &PlayerId)>,
     blades: Query<&ChildOf, With<BoomerangBlade>>,
-    thrown: Query<&Thrown, With<Thrown>>,
+    mut thrown: Query<(Entity, &Thrown, &mut Transform, &mut ConstantLinearAcceleration), With<Thrown>>,
     ticker: Res<Ticker>,
     mut sent_events: ResMut<LocalGameEvents>,
 ) {
@@ -88,7 +88,6 @@ pub fn detect_throw_strikes(
     };
 
     for event in collisions.read() {
-        println!("Detected collision");
         // Exactly one collider must be a blade. Neither -> a body-to-body bump;
         // both -> boomerang vs boomerang. Neither is a strike.
         let blade1 = blades.get(event.collider1).ok();
@@ -96,36 +95,32 @@ pub fn detect_throw_strikes(
         let (blade_child_of, other_body) = match (blade1, blade2) {
             (Some(c), None) => (c, event.body2),
             (None, Some(c)) => (c, event.body1),
-            (None, None) => {
-                println!("Not the right objects: 1");
-                continue
-            },
-            (Some(_), Some(_)) => {
-                println!("Not the right objects: 1.5");
-                continue
-            },
+            (_, _) => { continue },
         };
         let Some(other_body) = other_body else { continue };
 
-        let Ok(blade) = thrown.get(blade_child_of.parent()) else {
-            println!("Not the right objects: 2: {}", blade_child_of.parent().index());
+        let Ok(mut blade) = thrown.get_mut(blade_child_of.parent()) else {
             continue
         };
-        println!("Collided blade entity id: {}", blade_child_of.parent().index());
-        println!("Players: {}", players.iter().len());
         let Ok(player) = players.get(other_body) else {
-            println!("Not the right objects: 2.5: {}", other_body);
             continue
         };
 
-        let Some(player_id) = blade.player_id else {continue};
+        let Some(player_id) = blade.1.player_id else {continue};
 
-        let game_event = GameEffect::StrikePlayer {
-            striker_id: player_id,
-            struck_id: player.1.player_id,
-        };
-        commands.entity(player.0).insert(Dying{elapsed: 0.0});
-        record_game_effect(&in_replay, &client, &ticker, &mut sent_events, game_event);
+        if player_id == player.1.player_id {
+            println!("Here!!");
+            commands.entity(blade.0).set_parent_in_place(player.0);
+            commands.entity(blade.0).remove::<Thrown>();
+            blade.2.translation = Vec3::ZERO;
+        } else {
+            let game_event = GameEffect::StrikePlayer {
+                striker_id: player_id,
+                struck_id: player.1.player_id,
+            };
+            commands.entity(player.0).insert(Dying{elapsed: 0.0});
+            record_game_effect(&in_replay, &client, &ticker, &mut sent_events, game_event);
+        }
     }
 }
 

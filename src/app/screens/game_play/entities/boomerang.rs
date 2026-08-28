@@ -35,7 +35,6 @@ pub fn spawn_boomerang<'a>(
                 BoomerangBlade,
                 CollisionEventsEnabled,
             ));
-            println!("BoomerangBlade spawned: {}", boomerang_blade.id().index());
             // L foot: turns in -Z at the outer end, forming the base of the L
             // (mirrored about the xy plane).
             let boomerang_blade = l.spawn((
@@ -47,6 +46,5 @@ pub fn spawn_boomerang<'a>(
                 BoomerangBlade,
                 CollisionEventsEnabled,
             ));
-            println!("BoomerangBlade spawned: {}", boomerang_blade.id().index());
         });
 }
