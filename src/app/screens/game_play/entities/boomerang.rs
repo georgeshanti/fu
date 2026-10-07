@@ -14,6 +14,9 @@ pub struct Thrown {
     pub player_id: Option<u8>,
 }
 
+#[derive(Component)]
+pub struct InFlight;
+
 pub fn spawn_boomerang<'a>(
     boomerang: &'a mut EntityCommands,
     materials: &mut ResMut<Assets<StandardMaterial>>,

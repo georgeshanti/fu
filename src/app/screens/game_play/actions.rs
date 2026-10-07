@@ -1,9 +1,9 @@
 use std::{collections::{BTreeMap, BTreeSet}, f32::consts::PI, time::SystemTime};
 
 use avian3d::prelude::*;
-use bevy::{ecs::system::SystemState, prelude::*, transform};
+use bevy::{ecs::system::{SystemParam, SystemState}, prelude::*, transform};
 
-use crate::{app::{GameClientWrapper, screens::{app_state::AppState, game_play::{animations::{Dying, Swinging, ThrowingAnimation}, entities::boomerang::{self, Boomerang, Thrown}, phases::end::Score, state::{Dead, InReplay, LocalGameEvents, PlayerId, Ticker, record_player_action}, world::{GameLayer, spawn_world}}}}, server::{ClientEvent, Controller, OrderedF32, PlayerAction, ServerEvent}};
+use crate::{app::{GameClientWrapper, screens::{app_state::AppState, game_play::{animations::{Dying, Swinging, ThrowingAnimation}, entities::boomerang::{self, Boomerang, InFlight, Thrown}, phases::end::Score, state::{Dead, InReplay, LocalGameEvents, PlayerId, Ticker, record_player_action}, world::{GameLayer, spawn_world}}}}, server::{ClientEvent, Controller, OrderedF32, PlayerAction, ServerEvent}};
 
 /// Constant linear acceleration applied to the player to overcome ground friction.
 /// Derived from Coulomb friction: μ × g = 0.5 × 9.81 = 4.905 m/s²
@@ -52,31 +52,45 @@ pub struct PlayerActions {
     pub actions: Vec<PlayerAction>,
 }
 
+#[derive(SystemParam)]
+pub struct DrainServerEventStruct<'w, 's> {
+    commands: Commands<'w, 's>,
+    client: Res<'w, GameClientWrapper>,
+    ticker: ResMut<'w, Ticker>,
+    local_game_events: ResMut<'w, LocalGameEvents>,
+    players: Query<'w,'s, Entity, With<PlayerId>>,
+    boomerangs: Query<'w, 's, Entity, (With<Boomerang>, With<Thrown>)>,
+    meshes: ResMut<'w, Assets<Mesh>>,
+    materials: ResMut<'w, Assets<StandardMaterial>>,
+    in_replay: ResMut<'w, InReplay>,
+    next_state: ResMut<'w, NextState<AppState>>,
+    player_actions: ResMut<'w, PlayerActions>,
+}
+
 pub fn drain_server_events(
-    world: &mut World,
+    mut world: &mut World,
     // The queries and resources this system used to take as individual params are
     // now pulled out of the `World` via a cached `SystemState`. Keeping it in a
     // `Local` preserves the query/change-detection state across frames instead of
     // rebuilding it every call.
-    mut params: Local<SystemState<(
-        Commands,
-        Res<GameClientWrapper>,
-        Query<(Entity, &PlayerId, &mut LinearVelocity, &mut ConstantLinearAcceleration, &mut Transform, Option<&Children>), (With<PlayerId>, Without<Dying>, Without<Boomerang>)>,
-        Query<(Entity, &Transform), (With<Boomerang>, Without<Swinging>)>,
-        ResMut<Ticker>,
-        ResMut<LocalGameEvents>,
-        Query<Entity, With<PlayerId>>,
-        Query<Entity, (With<Boomerang>, With<Thrown>)>,
-        ResMut<Assets<Mesh>>,
-        ResMut<Assets<StandardMaterial>>,
-        ResMut<InReplay>,
-        ResMut<NextState<AppState>>,
-        ResMut<PlayerActions>,
-    )>>,
+    // mut params: Local<SystemState<(
+    mut local_system_state_drain_server_events_struct: Local<SystemState<DrainServerEventStruct>>,
+    // mut commands: Commands,
+    // client: Res<GameClientWrapper>,
+    // mut ticker: ResMut<Ticker>,
+    // mut local_game_events: ResMut<LocalGameEvents>,
+    // players: Query<Entity, With<PlayerId>>,
+    // boomerangs: Query<Entity, (With<Boomerang>, With<Thrown>)>,
+    // mut meshes: ResMut<Assets<Mesh>>,
+    // mut materials: ResMut<Assets<StandardMaterial>>,
+    // mut in_replay: ResMut<InReplay>,
+    // mut next_state: ResMut<NextState<AppState>>,
+    // mut player_actions: ResMut<PlayerActions>,
+    // )>>,
 ) {
+    let mut drain_server_events_struct = local_system_state_drain_server_events_struct.get_mut(&mut world);
     let (mut new_player_actions, server_events) = {
-        let client = params.get_mut(world).1;
-        let client = client.client.read().unwrap();
+        let client = drain_server_events_struct.client.client.read().unwrap();
         let events = {
             let mut server_events = client.received_events.lock().unwrap();
             let events = server_events.clone();
@@ -92,19 +106,17 @@ pub fn drain_server_events(
             ServerEvent::RoundEnded{ max, old_score, new_score} => {
                 // Leave the scene standing and hand over to `setup_round_ended`, which
                 // draws the result overlay on top of the now-frozen field.
-                let (mut commands, _, _, _, _, _, _, _, _, _, _, mut next_state, _) = params.get_mut(world);
-                commands.insert_resource(Score{time: SystemTime::now(), max, old_score, new_score, winners: vec![]});
-                next_state.set(AppState::RoundEndAnimation);
-                params.apply(world);
+                drain_server_events_struct.commands.insert_resource(Score{time: SystemTime::now(), max, old_score, new_score, winners: vec![]});
+                drain_server_events_struct.next_state.set(AppState::RoundEndAnimation);
+                // params.apply(world);
                 return;
             },
             ServerEvent::GameEnded{ max, old_score, new_score, game_winners} => {
                 // Leave the scene standing and hand over to `setup_round_ended`, which
                 // draws the result overlay on top of the now-frozen field.
-                let (mut commands, _, _, _, _, _, _, _, _, _, _, mut next_state, _) = params.get_mut(world);
-                commands.insert_resource(Score{time: SystemTime::now(), max, old_score, new_score, winners: game_winners.iter().map(|winner| {winner.id}).collect()});
-                next_state.set(AppState::RoundEndAnimation);
-                params.apply(world);
+                drain_server_events_struct.commands.insert_resource(Score{time: SystemTime::now(), max, old_score, new_score, winners: game_winners.iter().map(|winner| {winner.id}).collect()});
+                drain_server_events_struct.next_state.set(AppState::RoundEndAnimation);
+                // params.apply(world);
                 return;
             },
             _ => {}
@@ -112,18 +124,16 @@ pub fn drain_server_events(
     }
     if !new_player_actions.is_empty() {
         let final_tick = {
-            let ticker = params.get_mut(world).4;
-            std::cmp::max(new_player_actions.last().unwrap().0, ticker.0)
+            std::cmp::max(new_player_actions.last().unwrap().0, drain_server_events_struct.ticker.0)
         };
         let mut existing_records = {
             let first_tick = new_player_actions.first().unwrap().0;
-            let (mut commands, _, _, _, mut ticker, mut local_game_events, players, boomerangs, mut meshes, mut materials, mut in_replay, _, _) = params.get_mut(world);
-            let game_state = local_game_events.game_events.get(first_tick as usize).unwrap().game_state.clone();
-            spawn_world(&mut commands, &ticker, &mut materials, &mut meshes, players, boomerangs, game_state);
-            ticker.0 = first_tick;
-            in_replay.0 = true;
-            let existing_records = local_game_events.game_events[first_tick as usize..].to_vec();
-            local_game_events.game_events.drain(((first_tick as usize)+1)..);
+            let game_state = drain_server_events_struct.local_game_events.game_events.get(first_tick as usize).unwrap().game_state.clone();
+            spawn_world(&mut drain_server_events_struct.commands, &drain_server_events_struct.ticker, &mut drain_server_events_struct.materials, &mut drain_server_events_struct.meshes, drain_server_events_struct.players, drain_server_events_struct.boomerangs, game_state);
+            drain_server_events_struct.ticker.0 = first_tick;
+            drain_server_events_struct.in_replay.0 = true;
+            let existing_records = drain_server_events_struct.local_game_events.game_events[first_tick as usize..].to_vec();
+            drain_server_events_struct.local_game_events.game_events.drain(((first_tick as usize)+1)..);
             existing_records
         };
         // Apply the despawn/respawn queued by `spawn_world` NOW. The replay loop below
@@ -131,28 +141,27 @@ pub fn drain_server_events(
         // those queries would still match the old, about-to-be-despawned entities, and any
         // command targeting them (e.g. the `Swinging` insert) would be dropped when the
         // despawn finally landed.
-        params.apply(world);
+        // params.apply(world);
         let mut current_tick = {
-            let (_, _, _, _, ticker, _, players, _, mut meshes, mut materials, mut in_replay, _, _) = params.get_mut(world);
-            ticker.0
+            drain_server_events_struct.ticker.0
         };
+        drop(drain_server_events_struct);
         while current_tick <= final_tick {
+            let mut drain_server_events_struct = local_system_state_drain_server_events_struct.get_mut(&mut world);
             {
                 while !new_player_actions.is_empty() && new_player_actions.first().unwrap().0 == current_tick {
-                    let (mut commands, client, mut query, lobjects, mut ticker, mut sent_events, _, _, _, _, _, _, _) =
-                        params.get_mut(world);
                     let first = new_player_actions.first().unwrap();
                     {
-                        record_player_action(&client, &ticker, &mut sent_events, &first.1, false);
+                        record_player_action(&drain_server_events_struct.client, &drain_server_events_struct.ticker, &mut drain_server_events_struct.local_game_events, &first.1, false);
                     }
-                    apply_action_to_world(&first.1, world, &mut params);
+                    apply_action_to_world(&first.1, &mut drain_server_events_struct.player_actions);
                     new_player_actions.remove(0);
-                    params.apply(world);
+                    // params.apply(world);
                 }
                 {
                     if !existing_records.is_empty() {
                         for player_action in existing_records.first().unwrap().player_actions.iter() {
-                            apply_action_to_world(player_action, world, &mut params);
+                            apply_action_to_world(player_action, &mut drain_server_events_struct.player_actions);
                         }
                     }
                 }
@@ -161,31 +170,32 @@ pub fn drain_server_events(
             // Transform->Position sync (Prepare), clock advancement, and
             // Position->Transform writeback all live in FixedPostUpdate around the
             // PhysicsSchedule; running PhysicsSchedule alone simulates nothing visible.
+            drop(drain_server_events_struct);
             world.run_schedule(FixedPostUpdate);
-            params.apply(world);
+            let mut drain_server_events_struct = local_system_state_drain_server_events_struct.get_mut(&mut world);
+            // params.apply(world);
             if !existing_records.is_empty() {
-                let (_, client, _, _, _, mut local_game_events, _, _, _, _, _, _, _) = params.get_mut(world);
                 let old_game_effects = existing_records.first().unwrap().game_effects.clone();
-                let new_game_effects = local_game_events.game_events.get(current_tick as usize).unwrap().game_effects.clone();
+                let new_game_effects = drain_server_events_struct.local_game_events.game_events.get(current_tick as usize).unwrap().game_effects.clone();
                 let missing_game_effects = new_game_effects.difference(&old_game_effects);
                 for game_effect in missing_game_effects {
-                    let _ = client.client.read().unwrap().sender.clone().unwrap().send(ClientEvent::GameEffect { tick: current_tick, game_event: game_effect.clone() });
+                    let _ = drain_server_events_struct.client.client.read().unwrap().sender.clone().unwrap().send(ClientEvent::GameEffect { tick: current_tick, game_event: game_effect.clone() });
                 }
             }
             if !existing_records.is_empty() {
                 existing_records.remove(0);
             }
             current_tick = {
-                let (_, _, _, _, ticker, _, _, _, _, _, _, _, _) = params.get_mut(world);
-                ticker.0
+                // let (_, _, _, _, ticker, _, _, _, _, _, _, _, _) = params.get_mut(world);
+                drain_server_events_struct.ticker.0
             };
         }
         {
-            let (_, _, _, _, _, _, _, _, _, _, mut in_replay, _, _) = params.get_mut(world);
-            in_replay.0 = false;
+            let mut drain_server_events_struct = local_system_state_drain_server_events_struct.get_mut(&mut world);
+            drain_server_events_struct.in_replay.0 = false;
         }
         {
-            params.apply(world);
+            // params.apply(world);
         }
     }
 
@@ -196,31 +206,13 @@ pub fn drain_server_events(
 
 fn apply_action_to_world(
     player_action: &PlayerAction,
-    world: &mut World,
     // The queries and resources this system used to take as individual params are
     // now pulled out of the `World` via a cached `SystemState`. Keeping it in a
     // `Local` preserves the query/change-detection state across frames instead of
     // rebuilding it every call.
-    params: &mut Local<SystemState<(
-        Commands,
-        Res<GameClientWrapper>,
-        Query<(Entity, &PlayerId, &mut LinearVelocity, &mut ConstantLinearAcceleration, &mut Transform, Option<&Children>), (With<PlayerId>, Without<Dying>, Without<Boomerang>)>,
-        Query<(Entity, &Transform), (With<Boomerang>, Without<Swinging>)>,
-        ResMut<Ticker>,
-        ResMut<LocalGameEvents>,
-        Query<Entity, With<PlayerId>>,
-        Query<Entity, (With<Boomerang>, With<Thrown>)>,
-        ResMut<Assets<Mesh>>,
-        ResMut<Assets<StandardMaterial>>,
-        ResMut<InReplay>,
-        ResMut<NextState<AppState>>,
-        ResMut<PlayerActions>,
-    )>>,
+    player_actions: &mut ResMut<PlayerActions>,
 ) {
-    let (mut commands, client, mut query, lobjects, mut ticker, mut sent_events, _, _, _, _, _, _, mut player_actions) =
-        params.get_mut(world);
     player_actions.actions.push(player_action.clone());
-    params.apply(world);
 }
 
 pub fn move_player(
@@ -366,12 +358,11 @@ pub fn release_boomerang(
                             // new_transform.rotate_around(new_transform.translation + Vec3{x: 0.5, y: 0.0, z: 0.0}, Quat::from_rotation_y(3.0*PI/4.0));
                             let velocity = LinearVelocity::from(Vec3{x: x.0, y: 0.0, z: y.0}.normalize_or_zero() * (4.0 + (power.0 * 8.0)));
                             let angular_velocity = AngularVelocity(Vec3{x:0.0, y:8.0, z:0.0});
-                            println!("Transform: {:?}", new_transform);
-                            println!("Velocity: {:?}", velocity);
                             commands.entity(entity).detach_child(boomrang);
                             commands.entity(boomrang).insert((
                                 velocity,
                                 Thrown{player_id: Some(*player_id)},
+                                InFlight,
                                 new_transform,
                                 angular_velocity,
                                 RigidBody::Dynamic,
@@ -386,6 +377,21 @@ pub fn release_boomerang(
             return true;
         }
     });
+}
+
+pub fn boomerang_path(
+    mut players: Query<(Entity, &PlayerId, &Transform), (With<PlayerId>)>,
+    mut inflight_boomerangs: Query<(Entity, &Transform, &mut ConstantLinearAcceleration, &Thrown), (With<InFlight>)>, 
+) {
+    for mut inflight_boomerange in inflight_boomerangs {
+        for player in players {
+            if inflight_boomerange.3.player_id == Some(player.1.player_id) {
+                let mut direction = (player.2.translation - inflight_boomerange.1.translation).normalize_or_zero();
+                direction.y = 9.8;
+                *inflight_boomerange.2 = ConstantLinearAcceleration(direction);
+            }
+        }
+    }
 }
 
 
@@ -826,7 +832,6 @@ pub fn pull_boomerang(
             for (mut constant_linear_acceleration, thrown) in &mut thrown_boomerangs {
                 if thrown.player_id != Some(*player_id) { continue }
                 *constant_linear_acceleration = ConstantLinearAcceleration(Vec3::ZERO);
-                println!("acceleration: {:?}", constant_linear_acceleration);
             }
             return false;
         } else {
@@ -843,13 +848,11 @@ pub fn stop_pulling_boomerang(
     player_actions.actions.retain(|player_action| {
         if let PlayerAction::StartingPulling { player_id } = player_action {
             for (mut constant_linear_acceleration, thrown, boomerang_transform) in &mut thrown_boomerangs {
-                println!("Pulling");
                 if thrown.player_id != Some(*player_id) { continue }
                 let destination = players.iter().filter(|player| { player.0.player_id == *player_id}).collect::<Vec<(&PlayerId, &Transform)>>();
                 let Some((_, player_transform)) = destination.get(0) else { continue };
                 let direction = (player_transform.translation - boomerang_transform.translation).normalize_or_zero() + Vec3{x:0.0, y: 9.8, z: 0.0};
                 *constant_linear_acceleration = ConstantLinearAcceleration(direction);
-                println!("acceleration: {:?}", constant_linear_acceleration);
             }
             return false;
         } else {

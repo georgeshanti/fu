@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use avian3d::prelude::*;
 use bevy::prelude::*;
 
-use crate::{app::{GameClientWrapper, screens::{app_state::AppState, game_play::{actions::{PlayerActions, PlayerDirections, PlayerJumpCooldowns, PlayerSwingCooldowns, PlayersPulling, StartThrow}, animations::{DEAD_SCALE, DEATH_DURATION, Dying, Swinging, ThrowIndicator, ThrowingAnimation}, entities::boomerang::{Boomerang, Thrown, spawn_boomerang}, phases::end::{CountdownOverlay, CountdownText}, state::{Countdown, Dead, InReplay, LocalGameEvents, PendingSpawns, PlayerId, PlayerInfo, PlayerInfos, Ticker}}}}, server::{ClientEvent, GameState, PlayerBoomerangState, PlayerState, PlayerStatus, ServerEvent, ThrowingState}};
+use crate::{app::{GameClientWrapper, screens::{app_state::AppState, game_play::{actions::{PlayerActions, PlayerDirections, PlayerJumpCooldowns, PlayerSwingCooldowns, PlayersPulling, StartThrow}, animations::{DEAD_SCALE, DEATH_DURATION, Dying, Swinging, ThrowIndicator, ThrowingAnimation}, entities::{boomerang::{Boomerang, Thrown, spawn_boomerang}, player::create_player_entity}, phases::end::{CountdownOverlay, CountdownText}, state::{Countdown, Dead, InReplay, LocalGameEvents, PendingSpawns, PlayerId, PlayerInfo, PlayerInfos, Ticker}}}}, server::{ClientEvent, GameState, PlayerBoomerangState, PlayerState, PlayerStatus, ServerEvent, ThrowingState}};
 
 /// Seconds to wait (showing the countdown overlay) before telling the server we're ready.
 const COUNTDOWN_SECS: f32 = 3.0;
@@ -144,32 +144,7 @@ pub fn spawn_world(commands: &mut Commands, ticker: &Ticker, materials: &mut Res
         panic!("No players at {}", ticker.0);
     }
     for player in game_state.players.clone() {
-        let dying_scale = match player.status {
-            PlayerStatus::Alive => 0.0,
-            PlayerStatus::Dead => 1.0,
-            PlayerStatus::Dying { elapsed } => {
-                1.0 - (elapsed / DEATH_DURATION).clamp(0.0, 1.0)
-            },
-        };
-        let dying_scale = Vec3::splat(1.0 - dying_scale * (1.0 - DEAD_SCALE));
-        let mut player_entity = commands
-            .spawn((
-                Mesh3d(meshes.add(Cylinder::new(0.5, 1.0))),
-                MeshMaterial3d(materials.add(Color::srgba(player.color.red as f32 / 256.0, player.color.green as f32 / 256.0, player.color.blue as f32 / 256.0, 0.5))),
-                // NB: `.rotate()` mutates and returns `()` (which is a valid empty Bundle,
-                // so it compiles but silently inserts no Transform at all) — the builder
-                // form `.with_rotation()` is required here.
-                Transform::from_translation(player.position).with_rotation(player.rotation).with_scale(dying_scale),
-                RigidBody::Dynamic,
-                Collider::cylinder(0.5, 1.0),
-                CollisionLayers::new(GameLayer::Active, [GameLayer::Environment, GameLayer::Active]),
-                // Facing is driven manually (see `drain_server_events`); lock physics
-                // rotation so collisions don't tumble the cube and fight that facing.
-                LockedAxes::ROTATION_LOCKED,
-                ConstantLinearAcceleration(player.acceleration),
-                LinearVelocity(player.velocity),
-                PlayerId { player_id: player.player_id, color: player.color },
-            ));
+        let mut player_entity = create_player_entity(commands, player, materials, meshes);
         if let Some(boomerang_state) = player.bommerang {
             player_entity.with_children(|parent| {
                 // The L as a single entity, anchored at the point where it meets the
@@ -276,7 +251,6 @@ pub fn spawn_world(commands: &mut Commands, ticker: &Ticker, materials: &mut Res
             Boomerang,
             Visibility::default(),
         ));
-        println!("With acceleration: {}", thrown_boomerang.acceleration);
         boomerang.insert((
             Thrown{player_id: thrown_boomerang.player_id},
             Transform::from_translation(thrown_boomerang.position).with_rotation(thrown_boomerang.rotation),
