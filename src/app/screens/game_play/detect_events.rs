@@ -22,7 +22,7 @@ pub fn detect_swing_strikes(
     // Snapshot which player ids this client controls locally.
     let local_ids: Vec<u8> = {
         let client = client.client.read().unwrap();
-        let players = client.players.read().unwrap();
+        let players = client.get_players();
         players.iter().map(|p| p.id).collect()
     };
 
@@ -83,7 +83,7 @@ pub fn detect_throw_strikes(
     // Snapshot which player ids this client controls locally.
     let local_ids: Vec<u8> = {
         let client = client.client.read().unwrap();
-        let players = client.players.read().unwrap();
+        let players = client.get_players();
         players.iter().map(|p| p.id).collect()
     };
 

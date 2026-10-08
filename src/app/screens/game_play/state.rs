@@ -227,13 +227,11 @@ pub fn record_player_action(
     player_action: &PlayerAction,
     send_to_server: bool,
 ) {
-    if let Some(sender) = &client.client.read().unwrap().sender {
-        sent_events.insert_received_player_actions( vec![ (ticker.0, player_action.clone()) ]);
-        if send_to_server {
-            sender
-                .send(ClientEvent::PlayerAction { tick: ticker.0, game_event: player_action.clone() })
-                .ok();
-        }
+    let client = &client.client.read().unwrap();
+    sent_events.insert_received_player_actions( vec![ (ticker.0, player_action.clone()) ]);
+    if send_to_server {
+        client
+            .send(ClientEvent::PlayerAction { tick: ticker.0, game_event: player_action.clone() });
     }
 }
 
@@ -244,12 +242,10 @@ pub fn record_game_effect(
     sent_events: &mut ResMut<LocalGameEvents>,
     game_effect: GameEffect,
 ) {
-    if let Some(sender) = &client.client.read().unwrap().sender {
-        sent_events.insert_received_game_effects( vec![ (ticker.0, game_effect.clone()) ]);
-        if !in_replay.0 {
-            sender
-                .send(ClientEvent::GameEffect { tick: ticker.0, game_event: game_effect })
-                .ok();
-        }
+    let client = &client.client.read().unwrap();
+    sent_events.insert_received_game_effects( vec![ (ticker.0, game_effect.clone()) ]);
+    if !in_replay.0 {
+        client 
+            .send(ClientEvent::GameEffect { tick: ticker.0, game_event: game_effect });
     }
 }

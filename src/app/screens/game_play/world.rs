@@ -292,9 +292,8 @@ pub fn tick_countdown(
     }
     if countdown.remaining <= 0.0 {
         let client = client.client.read().unwrap();
-        if let (Some(sender), Some(id)) = (&client.sender, *client.client_id.read().unwrap()) {
-            sender.send(ClientEvent::PlayersSpawned { client_id: id }).ok();
-        }
+        let client_id = client.get_client_id().unwrap();
+        client.send(ClientEvent::PlayersSpawned { client_id: client_id });
     }
 }
 
@@ -305,12 +304,7 @@ pub fn wait_for_start(
     mut next_state: ResMut<NextState<AppState>>,
 ) {
     let client = client.client.read().unwrap();
-    let events = {
-        let mut server_events = client.received_events.lock().unwrap();
-        let events = server_events.clone();
-        *server_events = vec![];
-        events
-    };
+    let events = client.drain_events();
     for event in events {
         if let ServerEvent::StartRound = event {
             // Countdown finished: tell the server we're ready and remove the overlay.

@@ -108,7 +108,7 @@ pub fn start_throw_animation(
 ) {
     let roster: Vec<(u8, Controller)> = {
         let client = client.client.read().unwrap();
-        let players = client.players.read().unwrap();
+        let players = client.get_players();
         players.iter().map(|p| (p.id, p.controller)).collect()
     };
 

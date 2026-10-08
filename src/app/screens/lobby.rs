@@ -316,9 +316,7 @@ pub fn setup_lobby(
         });
 
     // Ask the server who is connected; the response is handled by `update_lobby`.
-    if let Some(sender) = &client.client.read().unwrap().sender {
-        sender.send(ClientEvent::FetchLobby).ok();
-    }
+    client.client.read().unwrap().send(ClientEvent::FetchLobby);
 }
 
 /// Drains server events and, on a `LobbyInfo`, rebuilds the player list to show
@@ -332,10 +330,7 @@ pub fn update_lobby(
 ) {
     let events = {
         let client = client.client.read().unwrap();
-        let mut server_events = client.received_events.lock().unwrap();
-        let events = server_events.clone();
-        *server_events = vec![];
-        events
+        client.drain_events()
     };
 
     for event in events {
@@ -345,13 +340,13 @@ pub fn update_lobby(
                 // `client_id` matches this client's assigned id.
                 {
                     let client = client.client.read().unwrap();
-                    if let Some(own_id) = *client.client_id.read().unwrap() {
+                    if let Some(own_id) = client.get_client_id() {
                         let mine = players
                             .iter()
                             .filter(|p| p.client_id == own_id)
                             .map(|p| ClientPlayer { id: p.id, name: p.name.clone(), controller: p.controller })
                             .collect();
-                        *client.players.write().unwrap() = mine;
+                        client.set_players(mine);
                     }
                 }
 
@@ -435,9 +430,7 @@ pub fn populate_controller_options(
         .client
         .read()
         .unwrap()
-        .players
-        .read()
-        .unwrap()
+        .get_players()
         .iter()
         .map(|p| p.controller)
         .collect();
@@ -593,18 +586,16 @@ pub fn handle_lobby_join_button(
                 continue;
             }
             let client_guard = client.client.read().unwrap();
-            let Some(client_id) = *client_guard.client_id.read().unwrap() else {
+            let Some(client_id) = client_guard.get_client_id() else {
                 continue; // not registered yet
             };
-            if let Some(sender) = &client_guard.sender {
                 let color = selected_color.0.unwrap();
                 let color = server::Color {
                     red: (PLAYER_COLORS[color].1.to_srgba().red*256.0) as u8,
                     green: (PLAYER_COLORS[color].1.to_srgba().green*256.0) as u8,
                     blue: (PLAYER_COLORS[color].1.to_srgba().blue*256.0) as u8,
                 };
-                sender.send(ClientEvent::JoinLobby { client_id, name: name.to_string(), controller, color }).ok();
-            }
+                client.client.read().unwrap().send(ClientEvent::JoinLobby { client_id, name: name.to_string(), controller, color });
         }
     }
 }
@@ -617,9 +608,7 @@ pub fn handle_lobby_start_button(
     for interaction in &interactions {
         if *interaction == Interaction::Pressed {
             let client_guard = client.client.read().unwrap();
-            if let Some(sender) = &client_guard.sender {
-                sender.send(ClientEvent::StartGame).ok();
-            }
+                client_guard.send(ClientEvent::StartGame);
         }
     }
 }

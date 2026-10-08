@@ -281,9 +281,7 @@ pub fn handle_continue_button(
     for interaction in &interactions {
         if *interaction == Interaction::Pressed {
             let client_guard = client.client.read().unwrap();
-            if let Some(sender) = &client_guard.sender {
-                sender.send(event.clone()).ok();
-            }
+            client_guard.send(event.clone());
         }
     }
 }
@@ -302,12 +300,7 @@ pub fn wait_for_next_round(
     mut next_state: ResMut<NextState<AppState>>,
 ) {
     let client = client.client.read().unwrap();
-    let events = {
-        let mut server_events = client.received_events.lock().unwrap();
-        let events = server_events.clone();
-        *server_events = vec![];
-        events
-    };
+    let events = client.drain_events();
     for event in events {
         match event {
             ServerEvent::SpawnPlayers { spawns } => {

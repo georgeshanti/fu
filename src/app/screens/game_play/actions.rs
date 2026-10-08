@@ -91,12 +91,7 @@ pub fn drain_server_events(
     let mut drain_server_events_struct = local_system_state_drain_server_events_struct.get_mut(&mut world);
     let (mut new_player_actions, server_events) = {
         let client = drain_server_events_struct.client.client.read().unwrap();
-        let events = {
-            let mut server_events = client.received_events.lock().unwrap();
-            let events = server_events.clone();
-            *server_events = vec![];
-            events
-        };
+        let events = client.drain_events();
         let mut player_actions: Vec<(u64, PlayerAction)> = events.iter().filter_map(|event| { if let ServerEvent::PlayerAction{tick: tick, game_event: game_event} = event { Some((*tick, game_event.clone())) } else { None } }).collect();
         player_actions.sort_by(|a, b| {a.0.cmp(&b.0)});
         (player_actions, events)
@@ -179,7 +174,7 @@ pub fn drain_server_events(
                 let new_game_effects = drain_server_events_struct.local_game_events.game_events.get(current_tick as usize).unwrap().game_effects.clone();
                 let missing_game_effects = new_game_effects.difference(&old_game_effects);
                 for game_effect in missing_game_effects {
-                    let _ = drain_server_events_struct.client.client.read().unwrap().sender.clone().unwrap().send(ClientEvent::GameEffect { tick: current_tick, game_event: game_effect.clone() });
+                    let _ = drain_server_events_struct.client.client.read().unwrap().send(ClientEvent::GameEffect { tick: current_tick, game_event: game_effect.clone() });
                 }
             }
             if !existing_records.is_empty() {
@@ -418,7 +413,7 @@ pub fn detect_player_movement(
     // lock before we touch the ECS.
     let roster: Vec<(u8, Controller)> = {
         let client = client.client.read().unwrap();
-        let players = client.players.read().unwrap();
+        let players = client.get_players();
         players.iter().map(|p| (p.id, p.controller)).collect()
     };
 
@@ -511,7 +506,7 @@ pub fn start_swing(
 ) {
     let roster: Vec<(u8, Controller)> = {
         let client = client.client.read().unwrap();
-        let players = client.players.read().unwrap();
+        let players = client.get_players();
         players.iter().map(|p| (p.id, p.controller)).collect()
     };
     let mut swings = vec![];
@@ -572,7 +567,7 @@ pub fn start_jump(
 ) {
     let roster: Vec<(u8, Controller)> = {
         let client = client.client.read().unwrap();
-        let players = client.players.read().unwrap();
+        let players = client.get_players();
         players.iter().map(|p| (p.id, p.controller)).collect()
     };
     let mut jumps = vec![];
@@ -627,7 +622,7 @@ pub fn start_throwing(
 ) {
     let roster: Vec<(u8, Controller)> = {
         let client = client.client.read().unwrap();
-        let players = client.players.read().unwrap();
+        let players = client.get_players();
         players.iter().map(|p| (p.id, p.controller)).collect()
     };
     let mut throwings = vec![];
@@ -678,7 +673,7 @@ pub fn start_pullback(
 ) {
     let roster: Vec<(u8, Controller)> = {
         let client = client.client.read().unwrap();
-        let players = client.players.read().unwrap();
+        let players = client.get_players();
         players.iter().map(|p| (p.id, p.controller)).collect()
     };
     let mut pulls = vec![];
@@ -728,7 +723,7 @@ pub fn stop_pullback(
 ) {
     let roster: Vec<(u8, Controller)> = {
         let client = client.client.read().unwrap();
-        let players = client.players.read().unwrap();
+        let players = client.get_players();
         players.iter().map(|p| (p.id, p.controller)).collect()
     };
     let mut pulls = vec![];
@@ -770,7 +765,7 @@ pub fn release_throw(
 ) {
     let roster: Vec<(u8, Controller)> = {
         let client = client.client.read().unwrap();
-        let players = client.players.read().unwrap();
+        let players = client.get_players();
         players.iter().map(|p| (p.id, p.controller)).collect()
     };
     let mut throwings = vec![];
