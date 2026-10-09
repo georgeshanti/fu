@@ -10,6 +10,7 @@ pub struct ClientPlayer {
 }
 
 /// Client-side handle: handle local game UI state and capture player input events
+#[cfg(not(target_arch = "wasm32"))]
 pub struct GameClient {
     /// Client id
     client_id: Arc<RwLock<Option<u8>>>,
@@ -22,8 +23,19 @@ pub struct GameClient {
     players: Arc<RwLock<Vec<ClientPlayer>>>,
 }
 
-impl GameClient {
-    pub fn new() -> (Self, Sender<ServerEvent>) {
+pub trait GameClientTrait {
+    pub fn new() -> (Self, Sender<ServerEvent>);
+    pub fn attach_sender(&mut self, sender: Sender<ClientEvent>);
+    pub fn set_players(&self, players: Vec<ClientPlayer>);
+    pub fn get_players(&self) -> Vec<ClientPlayer>;
+    pub fn get_client_id(&self) -> Option<u8>;
+    pub fn send(&self, event: ClientEvent);
+    pub fn drain_events(&self) -> Vec<ServerEvent>;
+    pub fn start_client(&self) -> JoinHandle<()>;
+}
+
+impl GameClientTrait for GameClient {
+    fn new() -> (Self, Sender<ServerEvent>) {
         let (sender, receiver) = mpsc::channel();
         let client = GameClient {
             client_id: Arc::new(RwLock::new(None)),
@@ -35,36 +47,36 @@ impl GameClient {
         (client, sender)
     }
 
-    pub fn attach_sender(&mut self, sender: Sender<ClientEvent>) {
+    fn attach_sender(&mut self, sender: Sender<ClientEvent>) {
         self.sender = Some(sender);
     }
 
-    pub fn set_players(&self, players: Vec<ClientPlayer>) {
+    fn set_players(&self, players: Vec<ClientPlayer>) {
         *(self.players.write().unwrap()) = players;
     }
 
-    pub fn get_players(&self) -> Vec<ClientPlayer> {
+    fn get_players(&self) -> Vec<ClientPlayer> {
         (*self.players.read().unwrap()).clone()
     }
 
-    pub fn get_client_id(&self) -> Option<u8> {
+    fn get_client_id(&self) -> Option<u8> {
        *self.client_id.read().unwrap()
     }
 
-    pub fn send(&self, event: ClientEvent) {
+    fn send(&self, event: ClientEvent) {
         if let Some(sender) = &self.sender {
             sender.send(event).unwrap()
         }
     }
 
-    pub fn drain_events(&self) -> Vec<ServerEvent> {
+    fn drain_events(&self) -> Vec<ServerEvent> {
         let mut events_guard = self.received_events.lock().unwrap();
         let events = events_guard.clone();
         *events_guard = vec![];
         events
     }
 
-    pub fn start_client(&self) -> JoinHandle<()> {
+    fn start_client(&self) -> JoinHandle<()> {
         let receiver = self.receiver.clone();
         let received_events = Arc::clone(&self.received_events);
         let client_id = self.client_id.clone();

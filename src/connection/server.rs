@@ -3,6 +3,8 @@ use std::{
 };
 use bevy::ecs::event::Event;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+
+#[cfg(not(target_arch = "wasm32"))]
 use tungstenite::{Message, WebSocket, handshake::derive_accept_key, protocol::Role};
 
 use crate::server::{ClientEvent, ClientEventOuter, ServerEvent};
